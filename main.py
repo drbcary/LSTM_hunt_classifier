@@ -20,9 +20,7 @@ warnings.filterwarnings('ignore')
 # ==========================================
 # 1. Configuration & Constants
 # ==========================================
-VIDEO_WIDTH = 514
-VIDEO_HEIGHT = 544
-VIDEO_FPS = 30.0
+import dataset_utils
 
 # Interpolation Settings
 RAT_LIKELIHOOD_THRESH = 0.9
@@ -37,53 +35,9 @@ EATING_BUFFER = 300   # Updated to 300 as discussed for better generalization
 LABEL_FILE_FILTER = "analyzed"
 VERBOSE = True
 
-# Directory Setup (Update paths if needed)
-LABEL_DIRS = [
-    r'Z:\LucasWahl\Excel files\Exp 5\Scn2a Observer',
-    r'Z:\LucasWahl\Excel files\Exp 4\WT observer'
-]
-
-DLC_DIRS = [
-    r'Z:\LucasWahl\Exp 5 - Scn2a mut observer data\Scn2a observer\hunt_crop',
-    r'Z:\LucasWahl\Exp 4 - WT naive + WT observer data\WT observer data\hunt_crop'
-]
-
 # ==========================================
 # 2. Helper Functions (Data Loading)
 # ==========================================
-
-def parse_file_metadata(filename):
-    match = re.search(r'(LW\d+)[-_](hunt[-_]?\d+)', filename, re.IGNORECASE)
-    if match:
-        return match.group(1), match.group(2).replace('_', '-')
-    return None, None
-
-def pair_files(label_dirs, dlc_dirs):
-    if VERBOSE: print(f"Scanning directories for files...")
-    label_files = []
-    for d in label_dirs:
-        label_files.extend(glob.glob(os.path.join(d, '*.xlsx')))
-    
-    dlc_files = []
-    for d in dlc_dirs:
-        dlc_files.extend(glob.glob(os.path.join(d, '*.csv')))
-        
-    paired_data = []
-    dlc_map = {}
-    for f in dlc_files:
-        animal, hunt = parse_file_metadata(os.path.basename(f))
-        if animal:
-            dlc_map[(animal, hunt)] = f
-            
-    iterator = tqdm(label_files, desc="Matching Files", disable=not VERBOSE)
-    for lf in iterator:
-        if LABEL_FILE_FILTER and LABEL_FILE_FILTER not in os.path.basename(lf):
-            continue
-        animal, hunt = parse_file_metadata(os.path.basename(lf))
-        if (animal, hunt) in dlc_map:
-            paired_data.append({'id': f"{animal}_{hunt}", 'label_path': lf, 'dlc_path': dlc_map[(animal, hunt)]})
-            
-    return paired_data
 
 def calculate_angle_3pts(a, b, c):
     ba = a - b
@@ -147,19 +101,19 @@ def load_and_process_dlc(filepath):
 
     return rat_head, rat_mid, rat_butt, rat_tail, cricket_pos
 
-def generate_features(rat_head, rat_mid, rat_butt, rat_tail, cricket_pos):
+def generate_features(rat_head, rat_mid, rat_butt, rat_tail, cricket_pos, video_width, video_fps):
     def dist(p1, p2): return np.linalg.norm(p1 - p2, axis=1)
     def get_derivs(pos_array):
-        vel_vec = np.diff(pos_array, axis=0, prepend=pos_array[0:1]) * VIDEO_FPS
-        speed = np.linalg.norm(vel_vec, axis=1) / VIDEO_WIDTH
-        acc_vec = np.diff(vel_vec, axis=0, prepend=vel_vec[0:1]) * VIDEO_FPS
-        accel = np.linalg.norm(acc_vec, axis=1) / VIDEO_WIDTH
+        vel_vec = np.diff(pos_array, axis=0, prepend=pos_array[0:1]) * video_fps
+        speed = np.linalg.norm(vel_vec, axis=1) / video_width
+        acc_vec = np.diff(vel_vec, axis=0, prepend=vel_vec[0:1]) * video_fps
+        accel = np.linalg.norm(acc_vec, axis=1) / video_width
         return speed, accel
 
-    d_head_cricket = dist(rat_head, cricket_pos) / VIDEO_WIDTH
-    d_head_mid = dist(rat_head, rat_mid) / VIDEO_WIDTH
-    d_mid_tail = dist(rat_mid, rat_tail) / VIDEO_WIDTH
-    d_head_tail = dist(rat_head, rat_tail) / VIDEO_WIDTH
+    d_head_cricket = dist(rat_head, cricket_pos) / video_width
+    d_head_mid = dist(rat_head, rat_mid) / video_width
+    d_mid_tail = dist(rat_mid, rat_tail) / video_width
+    d_head_tail = dist(rat_head, rat_tail) / video_width
     
     angle_spine = calculate_angle_3pts(rat_head, rat_mid, rat_tail) / 180.0
     rat_orientation = calculate_bearing(rat_mid, rat_head)
@@ -189,23 +143,29 @@ def create_dataset_sequences(paired_files):
     for pair in iterator:
         try:
             dlc_df = load_and_process_dlc(pair['dlc_path'])
-            labels_df = pd.read_excel(pair['label_path']) 
+            if dlc_df is None: continue
+            
+            video_width, _, video_fps = dataset_utils.get_video_params(pair['dlc_path'])
             
             rat_head, rat_mid, rat_butt, rat_tail, cricket_pos = dlc_df
-            full_features = generate_features(rat_head, rat_mid, rat_butt, rat_tail, cricket_pos)
+            full_features = generate_features(rat_head, rat_mid, rat_butt, rat_tail, cricket_pos, video_width, video_fps)
             total_frames = len(full_features)
             
-            valid_hunts = labels_df[labels_df['Include?'] == 'Include']
-            for _, row in valid_hunts.iterrows():
-                enter = int(row['Enter_Frame'])
-                capture = int(row['Capture_Frame'])
-                latency = int(row['Latency_to_Attack_Frames'])
-                pursuit_start = enter + latency
+            for hunt_data in pair['hunts']:
+                enter = hunt_data['enter']
+                capture = hunt_data['capture']
+                pursuit_start = hunt_data['pursuit_start']
+                cons_end = hunt_data['consumption_end']
                 
                 if enter >= capture or pursuit_start > capture: continue
                 
+                if cons_end is not None:
+                    eating_end_frame = cons_end
+                else:
+                    eating_end_frame = capture + EATING_BUFFER
+                
                 seq_start = max(0, enter - CONTEXT_BUFFER)
-                seq_end = min(total_frames, capture + EATING_BUFFER + CONTEXT_BUFFER)
+                seq_end = min(total_frames, eating_end_frame + CONTEXT_BUFFER)
                 
                 seq_features = full_features[seq_start:seq_end]
                 seq_len = len(seq_features)
@@ -215,7 +175,7 @@ def create_dataset_sequences(paired_files):
                 local_enter = enter - seq_start
                 local_pursuit = pursuit_start - seq_start
                 local_capture = capture - seq_start
-                local_eating_end = local_capture + EATING_BUFFER
+                local_eating_end = eating_end_frame - seq_start
                 
                 if local_pursuit > local_enter:
                     seq_targets[max(0, local_enter):min(seq_len, local_pursuit)] = 1
@@ -435,7 +395,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if VERBOSE: print(f"Training on: {device}")
     
-    pairs = pair_files(LABEL_DIRS, DLC_DIRS)
+    pairs = dataset_utils.pair_dataset_files(verbose=VERBOSE)
     if not pairs: return
 
     # 2. Data

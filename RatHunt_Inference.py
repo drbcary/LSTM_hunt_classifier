@@ -27,8 +27,8 @@ from VidLabeler import create_hunting_video_clip
 # (Must match training logic exactly)
 # ==========================================
 
-VIDEO_WIDTH = 514
-VIDEO_FPS = 30.0
+import dataset_utils
+
 RAT_LIKELIHOOD_THRESH = 0.82
 CRICKET_LIKELIHOOD_THRESH = 0.9
 MAX_INTERP_GAP = 10 
@@ -97,12 +97,12 @@ def load_and_process_dlc(filepath):
     
     return rat_head, rat_mid, rat_butt, rat_tail, cricket_pos
 
-def generate_features(rat_head, rat_mid, rat_butt, rat_tail, cricket_pos):
+def generate_features(rat_head, rat_mid, rat_butt, rat_tail, cricket_pos, video_width, video_fps):
     def dist(p1, p2): return np.linalg.norm(p1 - p2, axis=1)
-    d_head_cricket = dist(rat_head, cricket_pos) / VIDEO_WIDTH
-    d_head_mid = dist(rat_head, rat_mid) / VIDEO_WIDTH
-    d_mid_tail = dist(rat_mid, rat_tail) / VIDEO_WIDTH
-    d_head_tail = dist(rat_head, rat_tail) / VIDEO_WIDTH
+    d_head_cricket = dist(rat_head, cricket_pos) / video_width
+    d_head_mid = dist(rat_head, rat_mid) / video_width
+    d_mid_tail = dist(rat_mid, rat_tail) / video_width
+    d_head_tail = dist(rat_head, rat_tail) / video_width
     angle_spine = calculate_angle_3pts(rat_head, rat_mid, rat_tail) / 180.0
     rat_orientation = calculate_bearing(rat_mid, rat_head)
     target_vector = calculate_bearing(rat_head, cricket_pos)
@@ -111,11 +111,11 @@ def generate_features(rat_head, rat_mid, rat_butt, rat_tail, cricket_pos):
     angle_diff = angle_diff / np.pi
     
     def get_derivs(pos_array):
-        vel_vec = np.diff(pos_array, axis=0, prepend=pos_array[0:1]) * VIDEO_FPS
-        speed = np.linalg.norm(vel_vec, axis=1) / VIDEO_WIDTH
+        vel_vec = np.diff(pos_array, axis=0, prepend=pos_array[0:1]) * video_fps
+        speed = np.linalg.norm(vel_vec, axis=1) / video_width
         speed = np.clip(speed, 0, 2.0)
-        acc_vec = np.diff(vel_vec, axis=0, prepend=vel_vec[0:1]) * VIDEO_FPS
-        accel = np.linalg.norm(acc_vec, axis=1) / VIDEO_WIDTH
+        acc_vec = np.diff(vel_vec, axis=0, prepend=vel_vec[0:1]) * video_fps
+        accel = np.linalg.norm(acc_vec, axis=1) / video_width
         return speed, accel
     rat_speed, rat_accel = get_derivs(rat_head)
     cricket_speed, cricket_accel = get_derivs(cricket_pos)
@@ -136,8 +136,8 @@ def generate_features(rat_head, rat_mid, rat_butt, rat_tail, cricket_pos):
 # 4. Logic Refinement & Smoothing (UPDATED)
 # ==========================================
 
-def frames_to_time(frames):
-    seconds = frames / VIDEO_FPS
+def frames_to_time(frames, video_fps):
+    seconds = frames / video_fps
     td = timedelta(seconds=seconds)
     total_seconds = int(td.total_seconds())
     minutes, seconds = divmod(total_seconds, 60)
@@ -373,7 +373,7 @@ def plot_inference_results(probs, preds, refined_events=None, label_path=None, s
 # 6. Excel Generation
 # ==========================================
 
-def generate_analyzed_excel(events, output_path):
+def generate_analyzed_excel(events, output_path, video_fps):
     data_rows = []
     
     for i, event in enumerate(events):
@@ -393,15 +393,15 @@ def generate_analyzed_excel(events, output_path):
         row = {
             'Cricket_Number': i,
             'Enter_Frame': enter,
-            'Enter_Time': frames_to_time(enter),
+            'Enter_Time': frames_to_time(enter, video_fps),
             'Capture_Frame': capture,
-            'Capture_Time': frames_to_time(capture),
+            'Capture_Time': frames_to_time(capture, video_fps),
             'Time_to_Capture_Frames': total_frames,
-            'Time_to_Capture': frames_to_time(total_frames),
+            'Time_to_Capture': frames_to_time(total_frames, video_fps),
             'Pursuit_Time_Frames': pursuit_dur_frames,
-            'Pursuit_Time': frames_to_time(pursuit_dur_frames),
+            'Pursuit_Time': frames_to_time(pursuit_dur_frames, video_fps),
             'Latency_to_Attack_Frames': latency_frames,
-            'Latency_to_Attack': frames_to_time(latency_frames),
+            'Latency_to_Attack': frames_to_time(latency_frames, video_fps),
             'Remarks': remarks,
             'Include?': include_status
         }
@@ -471,7 +471,9 @@ def batch_process_dlc_folder(folder_path, model_path, device, label_folder=None)
             res = load_and_process_dlc(dlc_file)
             if res is None: continue
             rh, rm, rb, rt, cp = res
-            features = generate_features(rh, rm, rb, rt, cp)
+            
+            video_width, _, video_fps = dataset_utils.get_video_params(dlc_file)
+            features = generate_features(rh, rm, rb, rt, cp, video_width, video_fps)
             
             # B. Run Model
             seq_tensor = torch.tensor(features, dtype=torch.float32).unsqueeze(0).to(device)
@@ -507,7 +509,7 @@ def batch_process_dlc_folder(folder_path, model_path, device, label_folder=None)
             
             # E. Generate Excel
             if len(events) > 0:
-                generate_analyzed_excel(events, output_path)
+                generate_analyzed_excel(events, output_path, video_fps)
             else:
                 print(f"  -> No hunts detected in {filename}")
                 
@@ -531,7 +533,8 @@ def run_inference_on_video(dlc_path, model, device):
         return None, None
         
     rat_head, rat_mid, rat_butt, rat_tail, cricket_pos = processed_data
-    features = generate_features(rat_head, rat_mid, rat_butt, rat_tail, cricket_pos)
+    video_width, _, video_fps = dataset_utils.get_video_params(dlc_path)
+    features = generate_features(rat_head, rat_mid, rat_butt, rat_tail, cricket_pos, video_width, video_fps)
     
     # 2. Prepare Tensor
     # Batch size = 1, Length = full video
@@ -580,7 +583,8 @@ if __name__ == "__main__":
 
     res = load_and_process_dlc(dlc_file)
     rh, rm, rb, rt, cp = res
-    features = generate_features(rh, rm, rb, rt, cp)
+    video_width, _, video_fps = dataset_utils.get_video_params(dlc_file)
+    features = generate_features(rh, rm, rb, rt, cp, video_width, video_fps)
     cricket_vis = features[:, 10]
     refined_events = refine_predictions(probs, preds, cricket_vis)
 
