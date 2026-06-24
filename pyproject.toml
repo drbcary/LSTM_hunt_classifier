@@ -1,0 +1,30 @@
+[project]
+name = "lstm-hunt-label"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "imageio[ffmpeg]>=2.37.2",
+    "matplotlib>=3.10.7",
+    "opencv-python>=4.12.0.88",
+    "openpyxl>=3.1.5",
+    "pandas>=2.3.3",
+    "scikit-learn>=1.7.2",
+    "torch>=2.6.0",
+    "tqdm>=4.67.1",
+    "umap-learn>=0.5.9.post2",
+]
+
+
+
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu124"},
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
