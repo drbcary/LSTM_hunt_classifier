@@ -23,139 +23,16 @@ warnings.filterwarnings('ignore')
 # ==========================================
 import dataset_utils
 
-# Interpolation Settings
-RAT_LIKELIHOOD_THRESH = 0.9
-CRICKET_LIKELIHOOD_THRESH = 0.85
-MAX_INTERP_GAP = 15 
-
-# Context Settings
-CONTEXT_BUFFER = 300  # Frames of background to include BEFORE Enter
-EATING_BUFFER = 300   # Updated to 300 as discussed for better generalization
-
-# Sequence Length Randomization for Background
-MIN_BG_LEN = 500   # ~16 seconds
-MAX_BG_LEN = 2000  # ~66 seconds
-
-# Max number of background chunks to generate per video 
-MAX_BG_CHUNKS_PER_VIDEO = 5
-
 # File Filtering Settings
-LABEL_FILE_FILTER = "analyzed"
 VERBOSE = True
 
 # ==========================================
 # 2. Helper Functions (Data Loading)
 # ==========================================
-def calculate_angle_3pts(a, b, c):
-    ba = a - b
-    bc = c - b
-    cosine_angle = np.sum(ba*bc, axis=1) / (np.linalg.norm(ba, axis=1) * np.linalg.norm(bc, axis=1) + 1e-6)
-    angle = np.arccos(np.clip(cosine_angle, -1.0, 1.0))
-    return np.degrees(angle)
-
-def calculate_bearing(start_pt, end_pt):
-    return np.arctan2(end_pt[:, 1] - start_pt[:, 1], end_pt[:, 0] - start_pt[:, 0])
 
 # ==========================================
 # 3. Data Processing
 # ==========================================
-
-def load_and_process_dlc(filepath):
-    try:
-        df = pd.read_csv(filepath, header=[0, 1, 2], index_col=0)
-    except Exception as e:
-        if VERBOSE: print(f"Error loading CSV {filepath}: {e}")
-        return None
-
-    scorer = df.columns.get_level_values(0)[0]
-    
-    def get_part(part_name, thresh, interp_limit):
-        # Robust check for missing columns
-        if part_name not in df[scorer]:
-            return np.zeros(len(df)), np.zeros(len(df)), np.zeros(len(df))
-            
-        x = df[scorer][part_name]['x'].copy()
-        y = df[scorer][part_name]['y'].copy()
-        conf = df[scorer][part_name]['likelihood'].copy()
-        
-        mask = conf < thresh
-        x[mask] = np.nan
-        y[mask] = np.nan
-        
-        x = x.interpolate(method='linear', limit=interp_limit, limit_direction='both')
-        y = y.interpolate(method='linear', limit=interp_limit, limit_direction='both')
-        
-        return x.values, y.values, conf.values
-
-    # Process Rat
-    nose_x, nose_y, _ = get_part('nose', RAT_LIKELIHOOD_THRESH, MAX_INTERP_GAP)
-    head_x, head_y, _ = get_part('head', RAT_LIKELIHOOD_THRESH, MAX_INTERP_GAP)
-    mid_x, mid_y, _   = get_part('mid_body', RAT_LIKELIHOOD_THRESH, MAX_INTERP_GAP)
-    butt_x, butt_y, _ = get_part('butt', RAT_LIKELIHOOD_THRESH, MAX_INTERP_GAP)
-    tail_x, tail_y, _ = get_part('endtail', RAT_LIKELIHOOD_THRESH, MAX_INTERP_GAP)
-
-    rat_head = np.column_stack((head_x, head_y))
-    rat_nose = np.column_stack((nose_x, nose_y))
-    mask_head = np.isnan(rat_head[:,0])
-    rat_head[mask_head] = rat_nose[mask_head]
-    
-    rat_mid = np.column_stack((mid_x, mid_y))
-    rat_butt = np.column_stack((butt_x, butt_y))
-    rat_tail = np.column_stack((tail_x, tail_y))
-
-    # Process Cricket
-    c_x, c_y, c_conf = get_part('cricket', 0.0, MAX_INTERP_GAP)
-    bc_x, bc_y, bc_conf = get_part('blurry_cricket', 0.0, MAX_INTERP_GAP)
-    
-    final_cx = np.full_like(c_x, np.nan)
-    final_cy = np.full_like(c_y, np.nan)
-    
-    c_valid = c_conf > CRICKET_LIKELIHOOD_THRESH
-    bc_valid = bc_conf > CRICKET_LIKELIHOOD_THRESH
-    
-    final_cx[bc_valid] = bc_x[bc_valid]
-    final_cy[bc_valid] = bc_y[bc_valid]
-    final_cx[c_valid] = c_x[c_valid]
-    final_cy[c_valid] = c_y[c_valid]
-    
-    final_cx = pd.Series(final_cx).interpolate(limit=MAX_INTERP_GAP).values
-    final_cy = pd.Series(final_cy).interpolate(limit=MAX_INTERP_GAP).values
-    
-    cricket_pos = np.column_stack((final_cx, final_cy))
-
-    return rat_head, rat_mid, rat_butt, rat_tail, cricket_pos
-
-def generate_features(rat_head, rat_mid, rat_butt, rat_tail, cricket_pos, video_width, video_fps):
-    def dist(p1, p2): return np.linalg.norm(p1 - p2, axis=1)
-    def get_derivs(pos_array):
-        vel_vec = np.diff(pos_array, axis=0, prepend=pos_array[0:1]) * video_fps
-        speed = np.linalg.norm(vel_vec, axis=1) / video_width
-        acc_vec = np.diff(vel_vec, axis=0, prepend=vel_vec[0:1]) * video_fps
-        accel = np.linalg.norm(acc_vec, axis=1) / video_width
-        return speed, accel
-
-    d_head_cricket = dist(rat_head, cricket_pos) / video_width
-    d_head_mid = dist(rat_head, rat_mid) / video_width
-    d_mid_tail = dist(rat_mid, rat_tail) / video_width
-    d_head_tail = dist(rat_head, rat_tail) / video_width
-    
-    angle_spine = calculate_angle_3pts(rat_head, rat_mid, rat_tail) / 180.0
-    rat_orientation = calculate_bearing(rat_mid, rat_head)
-    target_vector = calculate_bearing(rat_head, cricket_pos)
-    angle_diff = target_vector - rat_orientation
-    angle_diff = (angle_diff + np.pi) % (2 * np.pi) - np.pi
-    angle_diff = angle_diff / np.pi
-    
-    rat_speed, rat_accel = get_derivs(rat_head)
-    cricket_speed, cricket_accel = get_derivs(cricket_pos)
-    cricket_visible = np.where(np.isnan(d_head_cricket), 0.0, 1.0)
-    
-    feature_stack = np.column_stack([
-        d_head_cricket, d_head_mid, d_mid_tail, d_head_tail,
-        angle_spine, angle_diff, rat_speed, rat_accel,
-        cricket_speed, cricket_accel, cricket_visible
-    ])
-    return np.nan_to_num(feature_stack, nan=0.0)
 
 def create_dataset_sequences(paired_files):
     all_sequences = []
@@ -166,16 +43,60 @@ def create_dataset_sequences(paired_files):
     
     for pair in iterator:
         try:
-            processed_data = load_and_process_dlc(pair['dlc_path'])
+            video_width, _, video_fps = dataset_utils.get_video_params(pair['dlc_path'])
+            
+            processed_data = dataset_utils.load_and_process_dlc(pair['dlc_path'], video_fps)
             if processed_data is None: continue
             
             dlc_df = processed_data
             
-            video_width, _, video_fps = dataset_utils.get_video_params(pair['dlc_path'])
-            
             rat_head, rat_mid, rat_butt, rat_tail, cricket_pos = dlc_df
-            full_features = generate_features(rat_head, rat_mid, rat_butt, rat_tail, cricket_pos, video_width, video_fps)
+            full_features = dataset_utils.generate_features(rat_head, rat_mid, rat_butt, rat_tail, cricket_pos, video_width, video_fps)
             total_frames = len(full_features)
+            
+            # Decide if this video is fully chunked
+            if random.random() < dataset_utils.FULL_VIDEO_CHUNK_PROPORTION:
+                for _ in range(dataset_utils.FULL_VIDEO_CHUNK_ITERATIONS):
+                    current_idx = 0
+                    while current_idx <= total_frames - dataset_utils.FULL_VIDEO_CHUNK_MIN:
+                        chunk_size = random.randint(dataset_utils.FULL_VIDEO_CHUNK_MIN, dataset_utils.FULL_VIDEO_CHUNK_MAX)
+                        end_idx = min(total_frames, current_idx + chunk_size)
+                        
+                        if (end_idx - current_idx) >= dataset_utils.FULL_VIDEO_CHUNK_MIN:
+                            seq_features = full_features[current_idx:end_idx]
+                            seq_len = len(seq_features)
+                            
+                            seq_targets = np.zeros(seq_len, dtype=int)
+                            
+                            for hunt_data in pair['hunts']:
+                                enter = hunt_data['enter']
+                                capture = hunt_data['capture']
+                                pursuit_start = hunt_data['pursuit_start']
+                                cons_end = hunt_data['consumption_end']
+                                
+                                if enter >= capture or pursuit_start > capture: continue
+                                if cons_end is not None:
+                                    eating_end_frame = cons_end
+                                else:
+                                    eating_end_frame = capture + dataset_utils.EATING_BUFFER
+                                    
+                                local_enter = enter - current_idx
+                                local_pursuit = pursuit_start - current_idx
+                                local_capture = capture - current_idx
+                                local_eating_end = eating_end_frame - current_idx
+                                
+                                if local_pursuit > max(0, local_enter) and local_enter < seq_len:
+                                    seq_targets[max(0, local_enter):min(seq_len, local_pursuit)] = 1
+                                if local_capture > max(0, local_pursuit) and local_pursuit < seq_len:
+                                    seq_targets[max(0, local_pursuit):min(seq_len, local_capture)] = 2
+                                if local_eating_end > max(0, local_capture) and local_capture < seq_len:
+                                    seq_targets[max(0, local_capture):min(seq_len, local_eating_end)] = 3
+                                    
+                            all_sequences.append(seq_features)
+                            all_targets.append(seq_targets)
+                            
+                        current_idx = end_idx
+                continue
             
             # --- BG CHUNK LIMITER ---
             # We want background, but not infinite background.
@@ -191,10 +112,10 @@ def create_dataset_sequences(paired_files):
                 
                 # 1. GAP HANDLING (With Limits)
                 gap_start = last_event_end
-                gap_end = max(0, enter - CONTEXT_BUFFER)
+                gap_end = max(0, enter - dataset_utils.CONTEXT_BUFFER)
                 
                 # Only add background if we haven't hit the limit for this video
-                if (gap_end - gap_start) > MIN_BG_LEN and bg_chunks_generated < MAX_BG_CHUNKS_PER_VIDEO:
+                if (gap_end - gap_start) > dataset_utils.MIN_BG_LEN and bg_chunks_generated < dataset_utils.MAX_BG_CHUNKS_PER_VIDEO:
                     
                     # Instead of slicing the whole gap, take random chunks from it
                     # This ensures we get variety without bloating the dataset
@@ -203,18 +124,19 @@ def create_dataset_sequences(paired_files):
                     gap_attempts = 0
                     current_idx = gap_start
                     
-                    while current_idx < (gap_end - MIN_BG_LEN) and gap_attempts < 2:
-                        chunk_size = random.randint(MIN_BG_LEN, MAX_BG_LEN)
+                    while current_idx < (gap_end - dataset_utils.MIN_BG_LEN) and gap_attempts < 2:
+                        chunk_size = random.randint(dataset_utils.MIN_BG_LEN, dataset_utils.MAX_BG_LEN)
                         end_idx = min(gap_end, current_idx + chunk_size)
                         
-                        if (end_idx - current_idx) >= MIN_BG_LEN:
+                        if (end_idx - current_idx) >= dataset_utils.MIN_BG_LEN:
                             all_sequences.append(full_features[current_idx:end_idx])
-                            all_targets.append(np.zeros(len(full_features[current_idx:end_idx]), dtype=int))
+                            
+                            targ_arr = np.zeros((end_idx - current_idx,), dtype=int)
+                            all_targets.append(targ_arr)
                             bg_chunks_generated += 1
-                        
-                        # Move randomly forward
-                        current_idx += chunk_size + random.randint(0, 500)
-                        gap_attempts += 1
+                            gap_attempts += 1
+                            
+                        current_idx = end_idx + random.randint(100, 300) # Jump forward
 
                 # 2. HUNT HANDLING (Same as before)
                 if enter >= capture or pursuit_start > capture: continue
@@ -224,7 +146,7 @@ def create_dataset_sequences(paired_files):
                 if cons_end is not None:
                     eating_end_frame = cons_end
                 else:
-                    eating_end_frame = capture + EATING_BUFFER
+                    eating_end_frame = capture + dataset_utils.EATING_BUFFER
                 
                 seq_start = max(0, enter - rand_buffer)
                 seq_end = min(total_frames, eating_end_frame + rand_buffer)
@@ -359,7 +281,7 @@ def plot_training_history(history):
     plt.show()
 
 
-def evaluate_and_plot(model, loader, device, num_plots=5):
+def evaluate_and_plot(model, loader, device, num_plots=5, save_path=None):
     """
     Plots model predictions vs ground truth for 4-Class Rat Hunting Model.
     Classes: 0=Background, 1=Stalking, 2=Pursuit, 3=Eating
@@ -449,7 +371,13 @@ def evaluate_and_plot(model, loader, device, num_plots=5):
                                       color='red', alpha=0.1, label='True Pursuit Zone')
 
                 plt.tight_layout()
-                plt.show()
+                if save_path:
+                    os.makedirs(save_path, exist_ok=True)
+                    plot_filename = os.path.join(save_path, f"eval_plot_{found_plots + 1}.png")
+                    plt.savefig(plot_filename, dpi=200, bbox_inches='tight')
+                    plt.close(fig)
+                else:
+                    plt.show()
                 
                 found_plots += 1
 
@@ -461,6 +389,14 @@ def evaluate_and_plot(model, loader, device, num_plots=5):
 def main():
     # 1. Setup
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # Cap VRAM usage to ~80% to allow for video playback/other tasks without throttling
+    if device.type == 'cuda':
+        try:
+            torch.cuda.set_per_process_memory_fraction(0.8, device=0)
+        except Exception as e:
+            if VERBOSE: print(f"Could not cap VRAM: {e}")
+            
     if VERBOSE: print(f"Training on: {device}")
     
     pairs = dataset_utils.pair_dataset_files(verbose=VERBOSE)
@@ -477,6 +413,13 @@ def main():
     print(f"Min: {min(lengths)}, Max: {max(lengths)}")
     print(f"Avg: {np.mean(lengths):.1f}")
     print(f"----------------------------------\n")
+
+    # # plot a histogram of the lengths
+    # plt.hist(lengths, bins=50)
+    # plt.xlabel("Sequence Length")
+    # plt.ylabel("Frequency")
+    # plt.title("Histogram of Sequence Lengths")
+    # plt.show()
 
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.1, random_state=42)
 
@@ -502,19 +445,22 @@ def main():
     val_loader = DataLoader(RatDataset(X_test, y_test), batch_size=12, shuffle=False, collate_fn=collate)
 
     # 3. Model
-    feat_dim = 11
+    feat_dim = 22
     h_dim = 256
     num_layers = 3
     model = HuntingBiLSTM(input_dim=feat_dim, hidden_dim=h_dim, num_layers=num_layers, num_classes=4).to(device) 
     
+    # load prev model
+    model.load_state_dict(torch.load(r"C:\Users\bcary\Documents\Work\CODE\CricketCode\LSTM_hunt_label\models\dan+lucas_0.15chunk2iters\BGadd_feat22_dim256_lay3_ep38_valf1=0.8270.pth", map_location=device))
+
     # Weights: [Background, Stalking, Pursuit, Eating]
-    weights = torch.tensor([0.25, 1.5, 2, 0.75], dtype=torch.float32).to(device)
+    weights = torch.tensor([0.25, 1.5, 2, 0.4], dtype=torch.float32).to(device)
     criterion = nn.CrossEntropyLoss(weight=weights, ignore_index=-100) 
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
+    optimizer = torch.optim.Adam(model.parameters(), lr=5e-4, weight_decay=1e-4)
     
-    # Scheduler: If validation F1 doesn't improve for 5 epochs, cut LR in half.
+    # Scheduler: If validation F1 doesn't improve for n epochs, cut LR in half.
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='max', factor=0.5, patience=5, verbose=True
+        optimizer, mode='max', factor=0.5, patience=4, verbose=True
     )
 
     # 4. Training Loop with History
@@ -525,7 +471,7 @@ def main():
     }
     best_val_f1 = 0.0
 
-    num_epochs = 250
+    num_epochs = 200
     if VERBOSE: print("Starting training...")
     
     for epoch in range(num_epochs):
@@ -565,6 +511,11 @@ def main():
             best_val_f1 = val_f1
             # torch.save(model.state_dict(), 'best_model_f1.pth')
             best_model = copy.deepcopy(model)
+
+            # Save Model
+            model_save_dir = r'C:\Users\bcary\Documents\Work\CODE\CricketCode\LSTM_hunt_label\models\dan+lucas_0.15chunk2iters'
+            model_save_name = f'BGadd_feat{feat_dim}_dim{h_dim}_lay{num_layers}_ep{epoch}_valf1={best_val_f1:.4f}.pth'
+            torch.save(best_model.state_dict(), os.path.join(model_save_dir, model_save_name))
             tqdm.write(f"--> New Best Model Saved! (F1: {best_val_f1:.4f})")
 
         # Update History
@@ -583,21 +534,25 @@ def main():
             print(f"Grad Norm -> Avg: {np.mean(epoch_grad_norms):.2f} | Max: {np.max(epoch_grad_norms):.2f}")
             
             if current_lr:
-                print(f'LR: {current_lr:.4f}')
-            
+                print(f'LR: {current_lr:.6f}')
+
+            training_val_dir = r'C:\Users\bcary\Documents\Work\CODE\CricketCode\LSTM_hunt_label\figs\temp_eval_plots'
+            new_path = os.path.join(training_val_dir, f'epoch_{epoch+1}')
+            os.makedirs(new_path, exist_ok=True)
+            evaluate_and_plot(model, val_loader, device, num_plots=10, save_path=new_path)
 
     # 5. Visualize History
     plot_training_history(history)
     
-    # 6. Save Model
-    model_save_name = f'BGadd_feat{feat_dim}_dim{h_dim}_lay{num_layers}_ep{epoch}_valf1={best_val_f1:.4f}.pth'
-    torch.save(best_model.state_dict(), model_save_name)
-    print("Model saved to rat_hunt_model_4class.pth")
+    # # 6. Save Model
+    # model_save_dir = r'C:\Users\bcary\Documents\Work\CODE\CricketCode\LSTM_hunt_label\models\dan_pv-cre'
+    # model_save_name = f'BGadd_feat{feat_dim}_dim{h_dim}_lay{num_layers}_ep{epoch}_valf1={best_val_f1:.4f}.pth'
+    # torch.save(best_model.state_dict(), model_save_name)
 
-    evaluate_and_plot(best_model, val_loader, device, num_plots=20)
+    # evaluate_and_plot(best_model, val_loader, device, num_plots=20)
 
-    # load prev model
-    model.load_state_dict(torch.load('BGadd_feat11_dim256_lay3_ep90_valf1=0.8106.pth', map_location=device))
+    # # load prev model
+    # model.load_state_dict(torch.load(r"C:\Users\bcary\Documents\Work\CODE\CricketCode\LSTM_hunt_label\models\dan_pv-cre\BGadd_feat22_dim256_lay3_ep23_valf1=0.9132.pth", map_location=device))
 
 if __name__ == "__main__":
     main()

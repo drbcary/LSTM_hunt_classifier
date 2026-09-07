@@ -97,7 +97,8 @@ preds_all = None
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 try:
-    from RatHunt_Inference import run_inference_on_video, load_and_process_dlc, generate_features
+    from RatHunt_Inference import run_inference_on_video
+    import dataset_utils
     print("Successfully imported RatHunt_Inference modules.")
     
     print(f"Loading Model from {MODEL_PATH}...")
@@ -113,9 +114,10 @@ try:
         probs, preds = run_inference_on_video(DLC_FILE, pretrained_model, device)
         preds_all = preds.cpu().numpy() if torch.is_tensor(preds) else preds
         
-        res = load_and_process_dlc(DLC_FILE)
+        video_width, _, video_fps = dataset_utils.get_video_params(DLC_FILE)
+        res = dataset_utils.load_and_process_dlc(DLC_FILE, video_fps)
         rh, rm, rb, rt, cp = res
-        features = generate_features(rh, rm, rb, rt, cp)
+        features = dataset_utils.generate_features(rh, rm, rb, rt, cp, video_width, video_fps)
         
         if torch.is_tensor(features):
             features_all = features.cpu().numpy()

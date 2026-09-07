@@ -1,4 +1,5 @@
 
+from matplotlib import pyplot
 import pandas as pd
 import numpy as np
 import torch
@@ -29,108 +30,7 @@ from VidLabeler import create_hunting_video_clip
 
 import dataset_utils
 
-RAT_LIKELIHOOD_THRESH = 0.82
-CRICKET_LIKELIHOOD_THRESH = 0.9
-MAX_INTERP_GAP = 10 
-EATING_BUFFER = 300 # Used for reconstructing ground truth labels
-
-# ==========================================
-# 3. Data Processing Helpers
-# ==========================================
-def calculate_angle_3pts(a, b, c):
-    ba = a - b
-    bc = c - b
-    cosine_angle = np.sum(ba*bc, axis=1) / (np.linalg.norm(ba, axis=1) * np.linalg.norm(bc, axis=1) + 1e-6)
-    angle = np.arccos(np.clip(cosine_angle, -1.0, 1.0))
-    return np.degrees(angle)
-
-def calculate_bearing(start_pt, end_pt):
-    return np.arctan2(end_pt[:, 1] - start_pt[:, 1], end_pt[:, 0] - start_pt[:, 0])
-
-def load_and_process_dlc(filepath):
-    try:
-        df = pd.read_csv(filepath, header=[0, 1, 2], index_col=0)
-    except: return None
-
-    scorer = df.columns.get_level_values(0)[0]
-    
-    def get_part(part_name, thresh=0.0):
-        if part_name not in df[scorer]:
-            return np.zeros(len(df)), np.zeros(len(df)), np.zeros(len(df))
-        x = df[scorer][part_name]['x'].copy()
-        y = df[scorer][part_name]['y'].copy()
-        conf = df[scorer][part_name]['likelihood'].copy()
-        mask = conf < thresh
-        x[mask] = np.nan
-        y[mask] = np.nan
-        x = x.interpolate(method='linear', limit=MAX_INTERP_GAP, limit_direction='both')
-        y = y.interpolate(method='linear', limit=MAX_INTERP_GAP, limit_direction='both')
-        return x.values, y.values, conf.values
-
-    nose_x, nose_y, _ = get_part('nose', RAT_LIKELIHOOD_THRESH)
-    head_x, head_y, _ = get_part('head', RAT_LIKELIHOOD_THRESH)
-    mid_x, mid_y, _   = get_part('mid_body', RAT_LIKELIHOOD_THRESH)
-    butt_x, butt_y, _ = get_part('butt', RAT_LIKELIHOOD_THRESH)
-    tail_x, tail_y, _ = get_part('endtail', RAT_LIKELIHOOD_THRESH)
-
-    rat_head = np.column_stack((head_x, head_y))
-    rat_nose = np.column_stack((nose_x, nose_y))
-    mask_head = np.isnan(rat_head[:,0])
-    rat_head[mask_head] = rat_nose[mask_head]
-    rat_mid = np.column_stack((mid_x, mid_y))
-    rat_butt = np.column_stack((butt_x, butt_y))
-    rat_tail = np.column_stack((tail_x, tail_y))
-
-    c_x, c_y, c_conf = get_part('cricket', 0.0)
-    bc_x, bc_y, bc_conf = get_part('blurry_cricket', 0.0)
-    final_cx = np.full_like(c_x, np.nan)
-    final_cy = np.full_like(c_y, np.nan)
-    c_valid = c_conf > CRICKET_LIKELIHOOD_THRESH
-    bc_valid = bc_conf > CRICKET_LIKELIHOOD_THRESH
-    final_cx[bc_valid] = bc_x[bc_valid]
-    final_cy[bc_valid] = bc_y[bc_valid]
-    final_cx[c_valid] = c_x[c_valid]
-    final_cy[c_valid] = c_y[c_valid]
-    final_cx = pd.Series(final_cx).interpolate(limit=MAX_INTERP_GAP).values
-    final_cy = pd.Series(final_cy).interpolate(limit=MAX_INTERP_GAP).values
-    cricket_pos = np.column_stack((final_cx, final_cy))
-    
-    return rat_head, rat_mid, rat_butt, rat_tail, cricket_pos
-
-def generate_features(rat_head, rat_mid, rat_butt, rat_tail, cricket_pos, video_width, video_fps):
-    def dist(p1, p2): return np.linalg.norm(p1 - p2, axis=1)
-    d_head_cricket = dist(rat_head, cricket_pos) / video_width
-    d_head_mid = dist(rat_head, rat_mid) / video_width
-    d_mid_tail = dist(rat_mid, rat_tail) / video_width
-    d_head_tail = dist(rat_head, rat_tail) / video_width
-    angle_spine = calculate_angle_3pts(rat_head, rat_mid, rat_tail) / 180.0
-    rat_orientation = calculate_bearing(rat_mid, rat_head)
-    target_vector = calculate_bearing(rat_head, cricket_pos)
-    angle_diff = target_vector - rat_orientation
-    angle_diff = (angle_diff + np.pi) % (2 * np.pi) - np.pi
-    angle_diff = angle_diff / np.pi
-    
-    def get_derivs(pos_array):
-        vel_vec = np.diff(pos_array, axis=0, prepend=pos_array[0:1]) * video_fps
-        speed = np.linalg.norm(vel_vec, axis=1) / video_width
-        speed = np.clip(speed, 0, 2.0)
-        acc_vec = np.diff(vel_vec, axis=0, prepend=vel_vec[0:1]) * video_fps
-        accel = np.linalg.norm(acc_vec, axis=1) / video_width
-        return speed, accel
-    rat_speed, rat_accel = get_derivs(rat_head)
-    cricket_speed, cricket_accel = get_derivs(cricket_pos)
-    
-    cricket_visible = np.where(np.isnan(d_head_cricket), 0.0, 1.0)
-    
-    feature_stack = np.column_stack([
-        d_head_cricket, d_head_mid, d_mid_tail, d_head_tail,
-        angle_spine, angle_diff, rat_speed, rat_accel,
-        cricket_speed, cricket_accel, cricket_visible
-    ])
-    mask_inv = 1.0 - cricket_visible
-    feature_stack[mask_inv == 1.0, 0] = 0.0 
-    feature_stack[mask_inv == 1.0, 5] = 0.0
-    return np.nan_to_num(feature_stack, nan=0.0)
+# The processing functions and configuration are now imported from dataset_utils.py
 
 # ==========================================
 # 4. Logic Refinement & Smoothing (UPDATED)
@@ -147,133 +47,101 @@ def frames_to_time(frames, video_fps):
     else:
         return f"00:{minutes:02}:{seconds:02}"
 
-def find_contiguous_blocks(mask):
-    bounded = np.concatenate(([0], mask.astype(int), [0]))
+_EMPIRICAL_TRANS_MAT = None
+
+def viterbi_decode(probs, transition_matrix, transition_weight=1.0):
+    """
+    Decodes the most likely state sequence using Viterbi algorithm in log space.
+    transition_weight > 1.0 makes off-diagonal transitions less likely.
+    """
+    num_frames, num_states = probs.shape
+    
+    if transition_weight != 1.0:
+        trans_mat = transition_matrix.copy()
+        for i in range(num_states):
+            non_diag = [j for j in range(num_states) if j != i]
+            trans_mat[i, non_diag] /= transition_weight
+        row_sums = trans_mat.sum(axis=1, keepdims=True)
+        trans_mat = trans_mat / row_sums
+    else:
+        trans_mat = transition_matrix
+        
+    log_probs = np.log(np.clip(probs, 1e-10, 1.0))
+    log_trans = np.log(np.clip(trans_mat, 1e-10, 1.0))
+    
+    dp = np.zeros((num_frames, num_states))
+    backpointers = np.zeros((num_frames, num_states), dtype=int)
+    
+    dp[0] = log_probs[0]
+    
+    for t in range(1, num_frames):
+        for s in range(num_states):
+            trans_probs = dp[t-1] + log_trans[:, s]
+            best_prev = np.argmax(trans_probs)
+            dp[t, s] = trans_probs[best_prev] + log_probs[t, s]
+            backpointers[t, s] = best_prev
+            
+    path = np.zeros(num_frames, dtype=int)
+    path[-1] = np.argmax(dp[-1])
+    for t in range(num_frames-2, -1, -1):
+        path[t] = backpointers[t+1, path[t+1]]
+        
+    return path
+
+def extract_events_from_path(path):
+    events = []
+    is_active = (path > 0)
+    
+    bounded = np.concatenate(([0], is_active.astype(int), [0]))
     diffs = np.diff(bounded)
     starts = np.where(diffs == 1)[0]
     ends = np.where(diffs == -1)[0]
-    return list(zip(starts, ends))
-
-def refine_predictions(probs, preds, cricket_visible_feature):
-    """
-    Robustly segments separate hunts and prevents overlap.
-    """
-    num_frames = len(preds)
     
-    # 1. Clean raw predictions
-    smooth_preds = pd.Series(preds).rolling(7, center=True).median().fillna(0).values.astype(int)
-    
-    # 2. Identify PURSUIT Anchors (Class 2)
-    is_pursuit = (smooth_preds == 2)
-    pursuit_blocks = find_contiguous_blocks(is_pursuit)
-    
-    # Merge close pursuit blocks
-    merged_pursuits = []
-    if pursuit_blocks:
-        curr_start, curr_end = pursuit_blocks[0]
-        for i in range(1, len(pursuit_blocks)):
-            next_start, next_end = pursuit_blocks[i]
-            if next_start - curr_end < 60:
-                curr_end = next_end 
-            else:
-                merged_pursuits.append((curr_start, curr_end))
-                curr_start, curr_end = next_start, next_end
-        merged_pursuits.append((curr_start, curr_end))
-    
-    valid_anchors = []
-    for s, e in merged_pursuits:
-        if (e - s) < 10: continue 
-        # Check if probability is high enough to be real
-        if np.max(probs[s:e, 2]) < 0.4: continue
-        valid_anchors.append((s, e))
+    for s, e in zip(starts, ends):
+        block = path[s:e]
         
-    events = []
-    last_hunt_end = 0 
-    
-    for i, (p_start, p_end) in enumerate(valid_anchors):
-        
-        # --- A. DETERMINE ENTER (STALKING START) ---
-        enter_frame = p_start
-        scan_limit = max(last_hunt_end, p_start - 2000) # Look back ~66s
-        
-        if p_start > scan_limit:
-            pre_window_preds = smooth_preds[scan_limit:p_start]
-            stalk_blocks = find_contiguous_blocks(pre_window_preds == 1)
+        pursuit_idx = np.where(block == 2)[0]
+        if len(pursuit_idx) == 0:
+            continue # Ignored: No pursuit state reached
             
-            if stalk_blocks:
-                global_stalk_blocks = [(s + scan_limit, e + scan_limit) for s, e in stalk_blocks]
-                current_head = p_start
-                
-                # Consolidate backward
-                for sb_start, sb_end in reversed(global_stalk_blocks):
-                    gap_start = sb_end
-                    gap_end = current_head
-                    gap_len = gap_end - gap_start
-                    
-                    # Connect if gap is small OR if gap has "soft stalking" probability
-                    is_connected = False
-                    if gap_len < 150: 
-                        is_connected = True
-                    elif gap_len < 600:
-                        # Check probability of Stalking (Class 1) in the gap
-                        # If avg prob > 0.2, it's likely a continuous stalk that dipped in confidence
-                        gap_stalk_prob = np.mean(probs[gap_start:gap_end, 1])
-                        if gap_stalk_prob > 0.2:
-                            is_connected = True
-                            
-                    if is_connected:
-                        enter_frame = sb_start
-                        current_head = sb_start
-                    else:
-                        break
+        pursuit = s + pursuit_idx[0]
         
-        # --- B. DETERMINE CAPTURE (EATING START) ---
-        # Ensure we DO NOT cross into the next pursuit anchor
-        next_anchor_start = valid_anchors[i+1][0] if (i + 1) < len(valid_anchors) else num_frames
-        
-        capture_frame = p_end 
-        
-        # Look forward for Eating (Class 3)
-        # Stop looking if we hit the next hunt
-        scan_fwd_limit = min(next_anchor_start, p_end + 2000) 
-        
-        if scan_fwd_limit > p_end:
-            post_window_preds = smooth_preds[p_end:scan_fwd_limit]
-            eat_blocks = find_contiguous_blocks(post_window_preds == 3)
-            
-            if eat_blocks:
-                # If eating starts reasonably soon
-                first_eat_start = eat_blocks[0][0] + p_end
-                if (first_eat_start - p_end) < 150:
-                    # Valid eating detected.
-                    # We take the start of eating as the capture time
-                    capture_frame = first_eat_start
-                    
-                    # Check if this eating block runs into the next anchor
-                    # If the eating block ends exactly where the next pursuit starts, 
-                    # it's suspicious but technically allowable as a "catch immediately followed by theft/chase"
-                    # But usually, we just want to ensure we don't label the next pursuit as eating.
-                    # Our 'scan_fwd_limit' guarantees we don't look past the next anchor.
-                
-        # --- C. FINAL VALIDATION ---
-        remarks = ""
-        confidence = np.mean(probs[p_start:p_end, 2])
-        
-        if (capture_frame - enter_frame) < 15:
-            remarks = "Extremely Short Event"
-        elif confidence < 0.5:
-            remarks = "Low Confidence"
+        eat_idx = np.where(block == 3)[0]
+        if len(eat_idx) > 0:
+            capture = s + eat_idx[0]
+        else:
+            capture = e 
             
         events.append({
-            'enter': enter_frame,
-            'pursuit': p_start,
-            'capture': capture_frame,
-            'remarks': remarks
+            'enter': s,
+            'pursuit': pursuit,
+            'capture': capture,
+            'capture_end': e,
+            'remarks': 'HMM Decoded'
         })
         
-        # Update boundary: Next hunt cannot start before this one ends
-        last_hunt_end = capture_frame + 10 
+    return events
+
+def refine_predictions(probs, preds, cricket_visible_feature=None, transition_weight=5.0):
+    """
+    Replaces old logic with a strict chronological HMM Viterbi Decoder.
+    """
+    global _EMPIRICAL_TRANS_MAT
+    if _EMPIRICAL_TRANS_MAT is None:
+        try:
+            _EMPIRICAL_TRANS_MAT = dataset_utils.calculate_empirical_transition_matrix()
+            print("Loaded empirical transition matrix from training data.")
+        except Exception as e:
+            print(f"Warning: Failed to calculate empirical transition matrix: {e}")
+            _EMPIRICAL_TRANS_MAT = np.array([
+                [0.999, 0.001, 0.0,   0.0  ],
+                [0.05,  0.94,  0.01,  0.0  ],
+                [0.05,  0.0,   0.94,  0.01 ],
+                [0.05,  0.0,   0.0,   0.95 ]
+            ])
             
+    path = viterbi_decode(probs, _EMPIRICAL_TRANS_MAT, transition_weight=transition_weight)
+    events = extract_events_from_path(path)
     return events
 
 # ==========================================
@@ -286,11 +154,12 @@ def events_to_sequence(events, num_frames):
         enter = int(event['enter'])
         pursuit = int(event['pursuit'])
         capture = int(event['capture'])
+        capture_end = event.get('capture_end', capture + dataset_utils.EATING_BUFFER)
         
         enter = max(0, min(num_frames, enter))
         pursuit = max(0, min(num_frames, pursuit))
         capture = max(0, min(num_frames, capture))
-        eating_end = min(num_frames, capture + EATING_BUFFER)
+        eating_end = min(num_frames, int(capture_end))
         
         if pursuit > enter: seq[enter:pursuit] = 1 
         if capture > pursuit: seq[pursuit:capture] = 2 
@@ -298,9 +167,18 @@ def events_to_sequence(events, num_frames):
             
     return seq
 
-def plot_inference_results(probs, preds, refined_events=None, label_path=None, save_path=None, title="Inference Results"):
+def plot_inference_results(probs, preds, refined_events=None, label_path=None, save_path=None, title="Inference Results", label_format='lucas', dlc_path=None):
     num_frames = len(preds)
     frames = np.arange(num_frames)
+    
+    # Auto-detect if probs contains multi-window data
+    if isinstance(probs, dict) and 'windows' in probs:
+        final_probs = probs['final']
+        window_probs = probs['windows']
+        is_multi_window = True
+    else:
+        final_probs = probs
+        is_multi_window = False
     
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(15, 10), sharex=True, gridspec_kw={'height_ratios': [1, 1]})
     
@@ -308,7 +186,18 @@ def plot_inference_results(probs, preds, refined_events=None, label_path=None, s
     colors = ['lightgray', 'orange', 'red', 'green']
     
     for i, cls_name in enumerate(classes):
-        ax1.plot(frames, probs[:, i], label=cls_name, color=colors[i], linewidth=1.5, alpha=0.8)
+        if is_multi_window:
+            # Plot individual sliding windows (faint)
+            for w_data in window_probs:
+                w_start, w_end, w_p = w_data['start'], w_data['end'], w_data['probs']
+                w_frames = np.arange(w_start, w_end)
+                ax1.plot(w_frames, w_p[:, i], color=colors[i], linewidth=0.8, alpha=0.2)
+            
+            # Plot the final averaged consensus (bold)
+            ax1.plot(frames, final_probs[:, i], label=cls_name, color=colors[i], linewidth=2.0, alpha=0.9)
+        else:
+            # Standard single array plot
+            ax1.plot(frames, final_probs[:, i], label=cls_name, color=colors[i], linewidth=1.5, alpha=0.8)
     
     ax1.set_ylabel("Probability")
     ax1.set_title(f"{title} - Model Confidence")
@@ -325,18 +214,37 @@ def plot_inference_results(probs, preds, refined_events=None, label_path=None, s
 
     if label_path and os.path.exists(label_path):
         try:
-            labels_df = pd.read_excel(label_path)
-            # valid_hunts = labels_df[labels_df['Include?'] == 'Include']
-            valid_hunts = labels_df
+            if label_format == 'lucas':
+                valid_hunts = dataset_utils.parse_lucas_labels(label_path)
+            elif label_format == 'dan':
+                if dlc_path is None:
+                    print("Warning: dlc_path required to match session for Dan format. Ground truth not plotted.")
+                    valid_hunts = []
+                else:
+                    dan_hunts = dataset_utils.load_dan_labels(os.path.dirname(label_path))
+                    base = os.path.basename(dlc_path)
+                    import re
+                    # Match Animal_D(day)_HS(session)
+                    match = re.search(r'([a-zA-Z]+\d+)_D(\d+)_HS(\d+)', base, re.IGNORECASE)
+                    if match:
+                        animal = match.group(1).upper()
+                        session = int(match.group(3))
+                        valid_hunts = dan_hunts.get((animal, session), [])
+                    else:
+                        print(f"Warning: Could not parse animal/session from {base}. Ground truth not plotted.")
+                        valid_hunts = []
+            else:
+                valid_hunts = []
+
             true_seq = np.zeros(num_frames)
             
-            for _, row in valid_hunts.iterrows():
-                enter = int(row['Enter_Frame'])
-                capture = int(row['Capture_Frame'])
+            for row in valid_hunts:
+                enter = row['enter']
+                capture = row['capture']
+                pursuit_start = row['pursuit_start']
+                cons_end = row['consumption_end']
                 
-                # Estimate pursuit/eating for visual comparison if exact cols missing
-                pursuit_start = enter + int(row['Latency_to_Attack_Frames'])
-                eating_end = capture + EATING_BUFFER
+                eating_end = cons_end if cons_end is not None else capture + dataset_utils.EATING_BUFFER
                 
                 enter = max(0, min(num_frames, enter))
                 pursuit_start = max(0, min(num_frames, pursuit_start))
@@ -380,6 +288,7 @@ def generate_analyzed_excel(events, output_path, video_fps):
         enter = event['enter']
         pursuit = event['pursuit']
         capture = event['capture']
+        capture_end = event.get('capture_end', capture + dataset_utils.EATING_BUFFER)
         remarks = event.get('remarks', '')
         
         latency_frames = pursuit - enter if pursuit != -1 else 0
@@ -396,6 +305,8 @@ def generate_analyzed_excel(events, output_path, video_fps):
             'Enter_Time': frames_to_time(enter, video_fps),
             'Capture_Frame': capture,
             'Capture_Time': frames_to_time(capture, video_fps),
+            'Consumption_End_Frame': capture_end,
+            'Consumption_Time': frames_to_time(capture_end, video_fps),
             'Time_to_Capture_Frames': total_frames,
             'Time_to_Capture': frames_to_time(total_frames, video_fps),
             'Pursuit_Time_Frames': pursuit_dur_frames,
@@ -418,19 +329,31 @@ def generate_analyzed_excel(events, output_path, video_fps):
 # 7. Main Batch Processor
 # ==========================================
 
-def batch_process_dlc_folder(folder_path, model_path, device, label_folder=None):
+def batch_process_dlc_folder(folder_path, model_path, device, label_folder=None, label_format=None, window_size=6000, step_size=1000, output_subdir="excel_files", plot_subdir="plots", prob_subdir=None):
     # 1. Load Model
     print(f"Loading Model from {model_path}...")
-    # Updated to your current best model size
-    model = HuntingBiLSTM(input_dim=11, hidden_dim=256, num_layers=3, num_classes=4).to(device)
+    model = HuntingBiLSTM(input_dim=22, hidden_dim=256, num_layers=3, num_classes=4).to(device)
     model.load_state_dict(torch.load(model_path, map_location=device))
     model.eval()
     
     # 2. Prepare Output Dirs
-    output_dir = os.path.join(folder_path, "excel_files")
-    plot_dir = os.path.join(folder_path, "plots")
-    os.makedirs(output_dir, exist_ok=True)
-    os.makedirs(plot_dir, exist_ok=True)
+    if output_subdir:
+        output_dir = os.path.join(folder_path, output_subdir)
+        os.makedirs(output_dir, exist_ok=True)
+    else:
+        output_dir = folder_path
+        
+    if plot_subdir:
+        plot_dir = os.path.join(folder_path, plot_subdir)
+        os.makedirs(plot_dir, exist_ok=True)
+    else:
+        plot_dir = folder_path
+        
+    if prob_subdir:
+        prob_dir = os.path.join(folder_path, prob_subdir)
+        os.makedirs(prob_dir, exist_ok=True)
+    else:
+        prob_dir = folder_path
     
     # 3. Find Files
     dlc_files = glob.glob(os.path.join(folder_path, "*.csv"))
@@ -439,54 +362,42 @@ def batch_process_dlc_folder(folder_path, model_path, device, label_folder=None)
     for dlc_file in dlc_files:
         filename = os.path.basename(dlc_file)
         
-        # NEW REGEX STRATEGY:
-        # 1. Try strict Observe-Hunt format: LW39-observe-LW40-hunt-1...
-        match_complex = re.search(r'(LW\d+)[-_]observe[-_](LW\d+)[-_]hunt[-_]?(\d+)', filename, re.IGNORECASE)
-        
-        # 2. Fallback to simple Hunt format: LW40-hunt-1...
-        match_simple = re.search(r'(LW\d+)[-_]hunt[-_]?(\d+)', filename, re.IGNORECASE)
-        
-        if match_complex:
-            obs_animal = match_complex.group(1)
-            hunt_animal = match_complex.group(2)
-            hunt_num = match_complex.group(3)
-            output_filename = f"{obs_animal}-observe-{hunt_animal}-hunt-{hunt_num}_analyzed.xlsx"
-            plot_title = f"{obs_animal} observing {hunt_animal} (Hunt {hunt_num})"
+        # Universal cleanup: strip DLC output suffix and file extension
+        clean_base = re.sub(r'DLC_resnet50.*\.csv$', '', filename, flags=re.IGNORECASE)
+        if clean_base == filename:
+            clean_base = filename[:-4] # Fallback if regex doesn't match
             
-        elif match_simple:
-            hunt_animal = match_simple.group(1)
-            hunt_num = match_simple.group(2)
-            output_filename = f"{hunt_animal}-hunt-{hunt_num}_analyzed.xlsx"
-            plot_title = f"{hunt_animal} (Hunt {hunt_num})"
-            
-        else:
-            print(f"Skipping {filename}: Could not parse Animal ID/Hunt pattern.")
-            continue
+        output_filename = f"{clean_base}_analyzed.xlsx"
+        plot_title = clean_base
+        
+        # Determine label format
+        curr_label_format = label_format
+        if curr_label_format is None:
+            if clean_base.startswith('LW'):
+                curr_label_format = 'lucas'
+            else:
+                curr_label_format = 'dan'
             
         output_path = os.path.join(output_dir, output_filename)
         print(f"Processing {filename} -> {output_filename}...")
         
         try:
-            # A. Load Data
-            res = load_and_process_dlc(dlc_file)
-            if res is None: continue
-            rh, rm, rb, rt, cp = res
+            # B. Run Model via sliding windows (using matching settings from single inference)
+            probs, preds = run_inference_on_video(dlc_file, model, device, 
+                                                  window_size=window_size, step_size=step_size, 
+                                                  return_all_windows=True)
             
-            video_width, _, video_fps = dataset_utils.get_video_params(dlc_file)
-            features = generate_features(rh, rm, rb, rt, cp, video_width, video_fps)
+            if probs is None: continue
             
-            # B. Run Model
-            seq_tensor = torch.tensor(features, dtype=torch.float32).unsqueeze(0).to(device)
-            lengths = torch.tensor([len(features)]).cpu()
+            final_probs = probs['final'] if isinstance(probs, dict) else probs
             
-            with torch.no_grad():
-                logits = model(seq_tensor, lengths)
-                probs = torch.softmax(logits, dim=2).cpu().numpy()[0]
-                preds = torch.argmax(logits, dim=2).cpu().numpy()[0]
+            # Save Probabilities
+            prob_path = os.path.join(prob_dir, f"{clean_base}_probs.csv")
+            prob_df = pd.DataFrame(final_probs, columns=['Background', 'Stalking', 'Pursuit', 'Eating'])
+            prob_df.to_csv(prob_path, index=False)
                 
-            # C. Clean Predictions
-            cricket_vis = features[:, 10]
-            events = refine_predictions(probs, preds, cricket_vis)
+            # C. Clean Predictions with HMM
+            events = refine_predictions(final_probs, preds)
             
             # D. Plotting
             plot_filename = output_filename.replace('.xlsx', '.png')
@@ -494,20 +405,41 @@ def batch_process_dlc_folder(folder_path, model_path, device, label_folder=None)
             
             label_path = None
             if label_folder:
-                 # Try to find exact match first
                  candidate = os.path.join(label_folder, output_filename)
                  if os.path.exists(candidate):
                      label_path = candidate
                  else:
-                     # Fallback: try to match partial name if format differs
-                     # e.g. if manual file is LW40-hunt-1 but output is LW39-observe-LW40...
-                     pass 
+                     potential_labels = glob.glob(os.path.join(label_folder, "*.xlsx"))
+                     
+                     if curr_label_format == 'lucas':
+                         # Match animal and hunt number
+                         match = re.search(r'(LW\d+)[-_]hunt[-_]?(\d+)', clean_base, re.IGNORECASE)
+                         if match:
+                             animal = match.group(1).lower()
+                             hunt_num = match.group(2)
+                             for pl in potential_labels:
+                                 pl_lower = os.path.basename(pl).lower().replace('_', '-')
+                                 if animal in pl_lower and f"hunt-{hunt_num}" in pl_lower:
+                                     label_path = pl
+                                     break
+                                     
+                     elif curr_label_format == 'dan':
+                         # Match just the animal. plot_inference_results will filter by session internally.
+                         match = re.search(r'([a-zA-Z]+\d+)_D\d+_HS\d+', clean_base, re.IGNORECASE)
+                         if match:
+                             animal = match.group(1).lower()
+                             for pl in potential_labels:
+                                 if animal in os.path.basename(pl).lower():
+                                     label_path = pl
+                                     break
             
             plot_inference_results(probs, preds, refined_events=events, 
                                    label_path=label_path, save_path=plot_path, 
-                                   title=plot_title)
+                                   title=plot_title, label_format=curr_label_format,
+                                   dlc_path=dlc_file)
             
             # E. Generate Excel
+            _, _, video_fps = dataset_utils.get_video_params(dlc_file)
             if len(events) > 0:
                 generate_analyzed_excel(events, output_path, video_fps)
             else:
@@ -518,9 +450,9 @@ def batch_process_dlc_folder(folder_path, model_path, device, label_folder=None)
             import traceback
             traceback.print_exc()
 
-def run_inference_on_video(dlc_path, model, device):
+def run_inference_on_video(dlc_path, model, device, use_sliding_window=True, window_size=2000, step_size=500, return_all_windows=False, use_max_prob=False):
     """
-    Runs the trained model on a full video DLC file.
+    Runs the trained model on a full video DLC file using an overlapping sliding window.
     Returns:
         probs: (N, 4) numpy array of class probabilities
         preds: (N,) numpy array of predicted class indices
@@ -528,31 +460,92 @@ def run_inference_on_video(dlc_path, model, device):
     print(f"Processing {dlc_path}...")
     
     # 1. Process Data
-    processed_data = load_and_process_dlc(dlc_path)
+    video_width, _, video_fps = dataset_utils.get_video_params(dlc_path)
+    processed_data = dataset_utils.load_and_process_dlc(dlc_path, video_fps, filter_poops=True, poop_dist_thresh=6, poop_thresh=0.8)
     if processed_data is None:
         return None, None
         
     rat_head, rat_mid, rat_butt, rat_tail, cricket_pos = processed_data
-    video_width, _, video_fps = dataset_utils.get_video_params(dlc_path)
-    features = generate_features(rat_head, rat_mid, rat_butt, rat_tail, cricket_pos, video_width, video_fps)
+    features = dataset_utils.generate_features(rat_head, rat_mid, rat_butt, rat_tail, cricket_pos, video_width, video_fps)
+    num_frames = len(features)
     
-    # 2. Prepare Tensor
-    # Batch size = 1, Length = full video
-    seq_tensor = torch.tensor(features, dtype=torch.float32).unsqueeze(0).to(device)
-    lengths = torch.tensor([len(features)]).cpu() # Length needed for pack_padded
-    
-    # 3. Run Model
+    # 2. Inference
     model.eval()
-    with torch.no_grad():
-        logits = model(seq_tensor, lengths)
-        probs = torch.softmax(logits, dim=2)
-        preds = torch.argmax(probs, dim=2)
+    full_tensor = torch.tensor(features, dtype=torch.float32).to(device)
     
-    # 4. Convert to Numpy (Strip batch dimension)
-    probs_np = probs[0].cpu().numpy()
-    preds_np = preds[0].cpu().numpy()
-    
-    return probs_np, preds_np
+    if use_sliding_window:
+        total_probs = np.zeros((num_frames, 4), dtype=np.float32)
+        counts = np.zeros((num_frames, 1), dtype=np.float32)
+        starts = list(range(0, num_frames, step_size))
+        
+        all_window_probs = [] if return_all_windows else None
+        
+        with torch.no_grad():
+            for start in starts:
+                end = min(start + window_size, num_frames)
+                
+                if (end - start) < 10:
+                    continue
+                    
+                chunk = full_tensor[start:end].unsqueeze(0)
+                lengths = torch.tensor([end - start]).cpu()
+                
+                logits = model(chunk, lengths)
+                probs = torch.softmax(logits, dim=2)[0].cpu().numpy()
+                
+                if return_all_windows:
+                    all_window_probs.append({
+                        'start': start,
+                        'end': end,
+                        'probs': probs.copy()
+                    })
+                
+                # Apply a Gaussian taper to down-weight the edges of the window
+                # where the BiLSTM lacks context, and prioritize the center.
+                chunk_len = end - start
+                mu = (chunk_len - 1) / 2.0
+                sigma = chunk_len / 3.0
+                x = np.arange(chunk_len)
+                gaussian_window = np.exp(-0.5 * ((x - mu) / sigma) ** 2).reshape(-1, 1)
+                
+                tapered_probs = probs * gaussian_window
+                
+                if use_max_prob:
+                    current_max = total_probs[start:end]
+                    total_probs[start:end] = np.maximum(current_max, tapered_probs)
+                else:
+                    total_probs[start:end] += tapered_probs
+                    counts[start:end] += gaussian_window
+                
+        if use_max_prob:
+            final_probs = total_probs
+            # Note: raw max probabilities across windows might not sum to exactly 1.0 per frame,
+            # but preserving the raw max is usually desired for this analysis.
+        else:
+            counts[counts == 0] = 1.0
+            final_probs = total_probs / counts
+        
+        
+        preds = np.argmax(final_probs, axis=1)
+        
+        if return_all_windows:
+            return {'final': final_probs, 'windows': all_window_probs}, preds
+            
+        return final_probs, preds
+    else:
+        # Standard full-sequence inference
+        with torch.no_grad():
+            chunk = full_tensor.unsqueeze(0)
+            lengths = torch.tensor([num_frames]).cpu()
+            logits = model(chunk, lengths)
+            final_probs = torch.softmax(logits, dim=2)[0].cpu().numpy()
+            preds = np.argmax(final_probs, axis=1)
+            
+        if return_all_windows:
+            all_window_probs = [{'start': 0, 'end': num_frames, 'probs': final_probs.copy()}]
+            return {'final': final_probs, 'windows': all_window_probs}, preds
+            
+        return final_probs, preds
 
 
 
@@ -566,41 +559,64 @@ if __name__ == "__main__":
 
     # dlc_file = r"Z:\LucasWahl\Exp 5 - Scn2a mut observer data\Scn2a observer\hunt_crop\LW79-hunt-1-09062024094954_huntPerfDLC_resnet50_Lucas_HuntObsMar6shuffle1_2430000.csv"
     
-    #LW134 hunt 1
-    dlc_file = r"Z:\LucasWahl\Exp 8 - Re-do of naive Wt and naive Scn2a data\hunt_crop\scn2a\LW134-hunt-1-03112025102959_huntPerfDLC_resnet50_Lucas_HuntObsMar6shuffle1_2430000.csv"
-    label_file = r"Z:\LucasWahl\Excel files\Exp 8 - naive wt vs naive scn2a\Exp 8 - naive wt vs naive scn2a\test_analyzed\scn2a\LW134-Hunt-1_analyzed.xlsx"
+    # LW134 hunt 1
+    dlc_file = r"\\research.brandeis.edu\turrigiano-lab\LucasWahl\Exp 8 - Re-do of naive Wt and naive Scn2a data\hunt_crop\scn2a\LW134-hunt-1-03112025102959_huntPerfDLC_resnet50_Lucas_HuntObsMar6shuffle1_2430000.csv"
+    label_file = r"\\research.brandeis.edu\turrigiano-lab\LucasWahl\Excel files\Exp 8 - naive wt vs naive scn2a\Exp 8 - naive wt vs naive scn2a\test_analyzed\scn2a\LW134-Hunt-1_analyzed.xlsx"
 
-    #example 
-    dlc_file = r"Z:\BrianCary\DATA\CricketHunt\dan\DLC_ex_vids\BL71_72-210224-155924_Crickets_BJL-210303-113352_Cam1_fr1-60396_lightDLC_resnet50_DanCrick_LightJun6shuffle1_1130000.csv"
-    label_file = r""
+    # example 
+    dlc_file = r"\\research.brandeis.edu\turrigiano-lab\DPL\DATA\PV-Cre\unused_animals\PV01_D1_HS1DLC_resnet50_MasterRatCrickHuntMar24shuffle1_1010000.csv"
+    label_file = r"\\research.brandeis.edu\turrigiano-lab\DPL\DATA\PV-Cre\CricketHuntTimes_PV\CricketHuntTimes_PV01.xlsx"
+
+    # just DLC
+    dlc_file = r"\\research.brandeis.edu\turrigiano-lab\DPL\DATA\XPro\XPRO\XP06_D1_HS3DLC_resnet50_MasterRatCrickHuntMar24shuffle1_1010000.csv"
+    label_file = None
 
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = HuntingBiLSTM(input_dim=11, hidden_dim=256, num_layers=3, num_classes=4).to(device) 
-    model.load_state_dict(torch.load('BGadd_feat11_dim256_lay3_ep50_valf1=0.8865.pth', map_location=device))
+    model = HuntingBiLSTM(input_dim=22, hidden_dim=256, num_layers=3, num_classes=4).to(device) 
+    # Model loading settings
+    model_path = r"C:\Users\bcary\Documents\Work\CODE\CricketCode\LSTM_hunt_label\models\dan+lucas_0.15chunk2iters\BGadd_feat22_dim256_lay3_ep30_valf1=0.8431.pth"
+    
+    model.load_state_dict(torch.load(model_path, map_location=device))
 
-    probs, preds = run_inference_on_video(dlc_file, model, device)
+    probs, preds = run_inference_on_video(dlc_file, model, device, step_size = 1000,
+                                        window_size = 6000, return_all_windows=True, use_max_prob=False)
 
-    res = load_and_process_dlc(dlc_file)
-    rh, rm, rb, rt, cp = res
-    video_width, _, video_fps = dataset_utils.get_video_params(dlc_file)
-    features = generate_features(rh, rm, rb, rt, cp, video_width, video_fps)
-    cricket_vis = features[:, 10]
-    refined_events = refine_predictions(probs, preds, cricket_vis)
+    # video_width, _, video_fps = dataset_utils.get_video_params(dlc_file)
+    # res = dataset_utils.load_and_process_dlc(dlc_file, video_fps)
+    # rh, rm, rb, rt, cp = res
+    # features = dataset_utils.generate_features(rh, rm, rb, rt, cp, video_width, video_fps)
+    # cricket_vis = features[:, 10]
 
-    plot_inference_results(probs, preds, refined_events=refined_events, label_path=label_file)
-    plot_inference_results(probs, preds, label_path=label_file)
+    refined_events = refine_predictions(probs['final'], preds)
+
+    # plot_inference_results(probs, preds, refined_events=refined_events, label_path=label_file,
+    #                     label_format='dan', dlc_path=dlc_file)
+    # plot_inference_results(probs, preds, refined_events=refined_events, label_path=label_file,
+    #                        label_format='lucas', dlc_path=dlc_file)
     plot_inference_results(probs, preds, refined_events=refined_events)
     # plot_inference_results(probs, preds)
+    plt.show()
 
-    video_path = r"Z:\LucasWahl\Exp 8 - Re-do of naive Wt and naive Scn2a data\hunt_crop\scn2a\LW134-hunt-1-03112025102959_huntPerfDLC_resnet50_Lucas_HuntObsMar6shuffle1_2430000_labeled.mp4"
-    output_path = r"LW134-hunt-1_ex_vid2.avi"
-    start_frame = 20330
-    end_frame = 21900
-    create_hunting_video_clip(video_path, probs, preds, start_frame, end_frame, output_path, trailing_frames=300)
+    # video_path = r"\\research.brandeis.edu\turrigiano-lab\DPL\DATA\PV-Cre\unused_animals\PV14_D1_HS2.avi"
+    video_path = r"\\research.brandeis.edu\turrigiano-lab\DPL\DATA\XPro\XPRO\XP06_D1_HS3.avi"
+    output_dir = r"C:\Users\bcary\Documents\Work\CODE\CricketCode\LSTM_hunt_label\vids"
+    output_path = os.path.join(output_dir, f"{os.path.basename(video_path)}_analyzed.avi")
+    start_frame = 11500
+    end_frame = 13500
+    create_hunting_video_clip(video_path, probs['final'], preds, start_frame, end_frame, output_path,
+                              trailing_frames=300, dlc_path=dlc_file, circle_radius=4, include_blurry_cricket=True,
+                              poop_dist_thresh=6, filter_poops=True, plot_poops=False)
 
     batch_process_dlc_folder(
-        folder_path=r"Z:\LucasWahl\Visual attention tracking project\Exp 5 - Scn2a mut observer data\hunt_crop", 
-        model_path="BGadd_feat11_dim256_lay3_ep50_valf1=0.8865.pth", 
-        device=device
+        folder_path=r"\\research.brandeis.edu\turrigiano-lab\DPL\DATA\PV-Cre\unused_animals", 
+        model_path=model_path, 
+        device=device,
+        window_size=6000,
+        step_size=1000,
+        label_format='dan',
+        label_folder=r"\\research.brandeis.edu\turrigiano-lab\DPL\DATA\PV-Cre\CricketHuntTimes_PV",
+        output_subdir=None,
+        plot_subdir="plots",
+        prob_subdir=None
     )
