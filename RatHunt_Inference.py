@@ -113,16 +113,34 @@ def viterbi_decode(probs, transition_matrix, transition_weight=1.0):
 
 def extract_events_from_path(path):
     events = []
-    is_active = (path > 0)
-    
-    bounded = np.concatenate(([0], is_active.astype(int), [0]))
-    diffs = np.diff(bounded)
-    starts = np.where(diffs == 1)[0]
-    ends = np.where(diffs == -1)[0]
-    
-    for s, e in zip(starts, ends):
-        block = path[s:e]
+    num_frames = len(path)
+    if num_frames == 0:
+        return events
         
+    # Detect all hunt starts:
+    # 1. Entering from Background (0 -> 1, 2, or 3)
+    # 2. Back-to-back hunt: direct transition from Eating (3) to Stalking (1) or Pursuit (2)
+    starts = []
+    for t in range(num_frames):
+        if path[t] > 0:
+            if t == 0 or path[t-1] == 0:
+                starts.append(t)
+            elif path[t-1] == 3 and path[t] in (1, 2):
+                starts.append(t)
+                
+    # For each hunt start, find its termination frame
+    for i, s in enumerate(starts):
+        if i + 1 < len(starts):
+            next_s = starts[i+1]
+            sub = path[s:next_s]
+            zeros = np.where(sub == 0)[0]
+            e = s + zeros[0] if len(zeros) > 0 else next_s
+        else:
+            sub = path[s:]
+            zeros = np.where(sub == 0)[0]
+            e = s + zeros[0] if len(zeros) > 0 else num_frames
+            
+        block = path[s:e]
         pursuit_idx = np.where(block == 2)[0]
         if len(pursuit_idx) == 0:
             continue # Ignored: No pursuit state reached
@@ -160,7 +178,7 @@ def refine_predictions(probs, preds, cricket_visible_feature=None, transition_we
                 [0.999, 0.001, 0.0,   0.0  ],
                 [0.05,  0.94,  0.01,  0.0  ],
                 [0.05,  0.0,   0.94,  0.01 ],
-                [0.05,  0.0,   0.0,   0.95 ]
+                [0.05,  0.005, 0.001, 0.944]
             ])
             
     path = viterbi_decode(probs, _EMPIRICAL_TRANS_MAT, transition_weight=transition_weight)
@@ -622,10 +640,10 @@ def match_hunt_events(true_hunts, pred_events, fps=30.0, video_name=""):
     if len(true_hunts) == 0 and len(pred_events) == 0:
         return matched_records, [], []
     if len(true_hunts) == 0:
-        unmatched_pred = [{**p, 'video': video_name} for p in pred_events]
+        unmatched_pred = [{**p, 'video': video_name, 'fps': fps} for p in pred_events]
         return matched_records, [], unmatched_pred
     if len(pred_events) == 0:
-        unmatched_true = [{**t, 'video': video_name} for t in true_hunts]
+        unmatched_true = [{**t, 'video': video_name, 'fps': fps} for t in true_hunts]
         return matched_records, unmatched_true, []
         
     candidates = []
@@ -688,8 +706,8 @@ def match_hunt_events(true_hunts, pred_events, fps=30.0, video_name=""):
             }
             matched_records.append(rec)
             
-    unmatched_true = [{**true_hunts[i], 'video': video_name} for i in range(len(true_hunts)) if i not in matched_t]
-    unmatched_pred = [{**pred_events[j], 'video': video_name} for j in range(len(pred_events)) if j not in matched_p]
+    unmatched_true = [{**true_hunts[i], 'video': video_name, 'fps': fps} for i in range(len(true_hunts)) if i not in matched_t]
+    unmatched_pred = [{**pred_events[j], 'video': video_name, 'fps': fps} for j in range(len(pred_events)) if j not in matched_p]
     
     return matched_records, unmatched_true, unmatched_pred
 
@@ -1016,10 +1034,11 @@ def plot_multiclass_roc_and_pr_curves(all_true, all_probs, save_path=None):
         print(f"Saved: {save_path}")
     plt.close(fig)
 
-def plot_hunt_detection_and_timing_errors(event_summary, matched_df, save_path=None):
+def plot_hunt_detection_and_timing_errors(event_summary, matched_df, save_path=None, log_scale=False):
     """
     Plots hunt-event detection performance breakdown (TP, FP, FN)
     and transition timing error distributions (Enter, Pursuit, Capture offsets in seconds).
+    If log_scale=True, plots absolute timing errors on a logarithmic y-axis.
     """
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 5.5), gridspec_kw={'width_ratios': [1, 1.4]})
     
@@ -1034,7 +1053,8 @@ def plot_hunt_detection_and_timing_errors(event_summary, matched_df, save_path=N
                  ha='center', va='bottom', fontsize=11, fontweight='bold')
                  
     ax1.set_ylabel('Number of Hunt Events', fontsize=11, fontweight='bold')
-    ax1.set_title('Hunt Event Detection Performance', fontsize=12, fontweight='bold', pad=10)
+    title_suffix = " [Log Scale]" if log_scale else ""
+    ax1.set_title(f'Hunt Event Detection Performance{title_suffix}', fontsize=12, fontweight='bold', pad=10)
     ax1.grid(axis='y', alpha=0.25, linestyle='--')
     ax1.spines['top'].set_visible(False)
     ax1.spines['right'].set_visible(False)
@@ -1056,29 +1076,74 @@ def plot_hunt_detection_and_timing_errors(event_summary, matched_df, save_path=N
         labels = ['Hunt Enter', 'Pursuit Start', 'Capture']
         data_to_plot = [matched_df[c].dropna().values for c in timing_cols]
         
-        box = ax2.boxplot(data_to_plot, patch_artist=True, tick_labels=labels,
-                          boxprops=dict(facecolor='#d5dbdb', color='black', alpha=0.7),
-                          medianprops=dict(color='#c0392b', linewidth=2.0),
-                          whiskerprops=dict(color='black', linewidth=1.2),
-                          capprops=dict(color='black', linewidth=1.2),
-                          flierprops=dict(marker='o', markersize=4, alpha=0.3))
-                          
-        # Overlay jittered points
-        for idx, d in enumerate(data_to_plot):
-            jitter = np.random.normal(0, 0.05, size=len(d))
-            ax2.scatter(np.ones(len(d))*(idx+1) + jitter, d, color='#2980b9', alpha=0.5, s=25, zorder=3)
+        if log_scale:
+            # Absolute errors floored at 0.01s (10 ms) for log scale
+            plot_data = [np.clip(np.abs(d), 0.01, None) for d in data_to_plot]
+            ax2.boxplot(plot_data, patch_artist=True, tick_labels=labels,
+                        boxprops=dict(facecolor='#d5dbdb', color='black', alpha=0.7),
+                        medianprops=dict(color='#c0392b', linewidth=2.0),
+                        whiskerprops=dict(color='black', linewidth=1.2),
+                        capprops=dict(color='black', linewidth=1.2),
+                        flierprops=dict(marker='o', markersize=4, alpha=0.3))
+                        
+            for idx, (raw_d, p_vals) in enumerate(zip(data_to_plot, plot_data)):
+                jitter = np.random.normal(0, 0.05, size=len(p_vals))
+                ax2.scatter(np.ones(len(p_vals))*(idx+1) + jitter, p_vals, color='#2980b9', alpha=0.5, s=25, zorder=3)
+                
+            ax2.set_yscale('log')
+            all_p = np.concatenate(plot_data) if len(plot_data) > 0 else []
+            if len(all_p) > 0:
+                log_min = np.min(all_p)
+                log_max = np.max(all_p)
+                ax2.set_ylim(bottom=max(0.005, log_min * 0.4), top=log_max * 5.0)
+                for idx, raw_d in enumerate(data_to_plot):
+                    mae = np.mean(np.abs(raw_d)) if len(raw_d) > 0 else 0.0
+                    med_abs = np.median(np.abs(raw_d)) if len(raw_d) > 0 else 0.0
+                    badge_y = log_max * 1.5
+                    ax2.text(idx + 1, badge_y,
+                             f"MAE: {mae:.2f}s\nMed |Err|: {med_abs:.2f}s",
+                             ha='center', va='bottom', fontsize=8.5, fontweight='bold',
+                             bbox=dict(boxstyle='round,pad=0.25', facecolor='white', alpha=0.9, edgecolor='#7f8c8d'))
+                             
+            ax2.axhline(1.0, color='gray', linestyle=':', linewidth=1.0, alpha=0.6)
+            ax2.axhline(5.0, color='#e74c3c', linestyle='--', linewidth=1.2, alpha=0.7)
+            ax2.set_ylabel('Absolute Timing Error in Seconds [Log Scale]', fontsize=11, fontweight='bold')
+            ax2.set_title('Transition Timing Accuracy [Absolute Errors, Log Scale]', fontsize=12, fontweight='bold', pad=10)
+            ax2.grid(axis='y', which='both', alpha=0.25, linestyle='--')
+        else:
+            box = ax2.boxplot(data_to_plot, patch_artist=True, tick_labels=labels,
+                              boxprops=dict(facecolor='#d5dbdb', color='black', alpha=0.7),
+                              medianprops=dict(color='#c0392b', linewidth=2.0),
+                              whiskerprops=dict(color='black', linewidth=1.2),
+                              capprops=dict(color='black', linewidth=1.2),
+                              flierprops=dict(marker='o', markersize=4, alpha=0.3))
+                              
+            # Overlay jittered points
+            for idx, d in enumerate(data_to_plot):
+                jitter = np.random.normal(0, 0.05, size=len(d))
+                ax2.scatter(np.ones(len(d))*(idx+1) + jitter, d, color='#2980b9', alpha=0.5, s=25, zorder=3)
+                
+            all_vals = np.concatenate(data_to_plot) if len(data_to_plot) > 0 else []
+            if len(all_vals) > 0:
+                y_min = np.min(all_vals)
+                y_max = np.max(all_vals)
+                y_span = max(1.0, y_max - y_min)
+                ax2.set_ylim(y_min - 0.08 * y_span, y_max + 0.22 * y_span)
+                
+                for idx, d in enumerate(data_to_plot):
+                    mae = np.mean(np.abs(d)) if len(d) > 0 else 0.0
+                    med = np.median(d) if len(d) > 0 else 0.0
+                    badge_y = y_max + 0.05 * y_span
+                    ax2.text(idx + 1, badge_y,
+                             f"MAE: {mae:.2f}s\nMed: {med:+.2f}s",
+                             ha='center', va='bottom', fontsize=8.5, fontweight='bold',
+                             bbox=dict(boxstyle='round,pad=0.25', facecolor='white', alpha=0.9, edgecolor='#7f8c8d'))
+                         
+            ax2.axhline(0, color='black', linestyle='--', linewidth=1.2, alpha=0.7)
+            ax2.set_ylabel('Timing Error in Seconds (Predicted - Manual)', fontsize=11, fontweight='bold')
+            ax2.set_title('Transition Timing Accuracy for Matched Hunts', fontsize=12, fontweight='bold', pad=10)
+            ax2.grid(axis='y', alpha=0.25, linestyle='--')
             
-            mae = np.mean(np.abs(d))
-            med = np.median(d)
-            ax2.text(idx + 1, ax2.get_ylim()[0] if ax2.get_ylim()[0] > -10 else -5,
-                     f"MAE: {mae:.2f}s\nMed: {med:+.2f}s",
-                     ha='center', va='bottom', fontsize=8.5, fontweight='bold',
-                     bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.8, edgecolor='gray'))
-                     
-        ax2.axhline(0, color='black', linestyle='--', linewidth=1.2, alpha=0.7)
-        ax2.set_ylabel('Timing Error in Seconds (Predicted - Manual)', fontsize=11, fontweight='bold')
-        ax2.set_title('Transition Timing Accuracy for Matched Hunts', fontsize=12, fontweight='bold', pad=10)
-        ax2.grid(axis='y', alpha=0.25, linestyle='--')
         ax2.spines['top'].set_visible(False)
         ax2.spines['right'].set_visible(False)
     else:
@@ -1090,6 +1155,12 @@ def plot_hunt_detection_and_timing_errors(event_summary, matched_df, save_path=N
         if save_path.endswith('.png'):
             plt.savefig(save_path.replace('.png', '.pdf'), bbox_inches='tight')
         print(f"Saved: {save_path}")
+        
+        # Automatically generate log-scale version every time
+        if not log_scale and save_path.endswith('.png'):
+            log_save = save_path.replace('.png', '_log.png')
+            plot_hunt_detection_and_timing_errors(event_summary, matched_df, save_path=log_save, log_scale=True)
+            
     plt.close(fig)
 
 def plot_duration_correlations(matched_df, save_path=None):
@@ -1189,7 +1260,7 @@ def plot_per_video_performance(per_video_df, save_path=None):
         print(f"Saved: {save_path}")
     plt.close(fig)
 
-def plot_master_evaluation_dashboard(all_true, all_raw, all_refined, all_probs, event_summary, matched_df, save_path=None):
+def plot_master_evaluation_dashboard(all_true, all_raw, all_refined, all_probs, event_summary, matched_df, save_path=None, log_scale=False):
     """
     Creates a master 6-panel executive summary dashboard combining the core evaluation figures.
     """
@@ -1281,20 +1352,54 @@ def plot_master_evaluation_dashboard(all_true, all_raw, all_refined, all_probs, 
         timing_cols = ['enter_error_sec', 'pursuit_error_sec', 'capture_error_sec']
         t_labels = ['Hunt Enter', 'Pursuit Start', 'Capture']
         data_plot = [matched_df[col].dropna().values for col in timing_cols]
-        axE.boxplot(data_plot, patch_artist=True, tick_labels=t_labels,
-                    boxprops=dict(facecolor='#d5dbdb', color='black', alpha=0.7),
-                    medianprops=dict(color='#c0392b', linewidth=2.0))
-        for idx, d in enumerate(data_plot):
-            jit = np.random.normal(0, 0.05, size=len(d))
-            axE.scatter(np.ones(len(d))*(idx+1) + jit, d, color='#2980b9', alpha=0.45, s=20, zorder=3)
-            mae = np.mean(np.abs(d))
-            axE.text(idx + 1, axE.get_ylim()[0] if axE.get_ylim()[0] > -8 else -4,
-                     f"MAE: {mae:.2f}s", ha='center', va='bottom', fontsize=8, fontweight='bold',
-                     bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.8, edgecolor='gray'))
-        axE.axhline(0, color='black', linestyle='--', linewidth=1.2, alpha=0.7)
-        axE.set_ylabel('Timing Error (s) [Pred - True]', fontsize=10.5, fontweight='bold')
-        axE.set_title('E. Transition Timing Accuracy', fontsize=12, fontweight='bold', pad=8)
-        axE.grid(axis='y', alpha=0.25, linestyle='--')
+        
+        if log_scale:
+            plot_vals_e = [np.clip(np.abs(d), 0.01, None) for d in data_plot]
+            axE.boxplot(plot_vals_e, patch_artist=True, tick_labels=t_labels,
+                        boxprops=dict(facecolor='#d5dbdb', color='black', alpha=0.7),
+                        medianprops=dict(color='#c0392b', linewidth=2.0))
+            for idx, (d, pv) in enumerate(zip(data_plot, plot_vals_e)):
+                jit = np.random.normal(0, 0.05, size=len(pv))
+                axE.scatter(np.ones(len(pv))*(idx+1) + jit, pv, color='#2980b9', alpha=0.45, s=20, zorder=3)
+            axE.set_yscale('log')
+            all_p = np.concatenate(plot_vals_e) if len(plot_vals_e) > 0 else []
+            if len(all_p) > 0:
+                log_max = np.max(all_p)
+                log_min = np.min(all_p)
+                axE.set_ylim(bottom=max(0.005, log_min * 0.4), top=log_max * 4.5)
+                for idx, (d, pv) in enumerate(zip(data_plot, plot_vals_e)):
+                    mae = np.mean(np.abs(d)) if len(d) > 0 else 0.0
+                    axE.text(idx + 1, log_max * 1.5, f"MAE: {mae:.2f}s", ha='center', va='bottom', fontsize=8, fontweight='bold',
+                             bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.9, edgecolor='#7f8c8d'))
+            axE.set_ylabel('|Timing Error| (s) [Log Scale]', fontsize=10.5, fontweight='bold')
+            axE.set_title('E. Timing Accuracy (|Err|, Log Scale)', fontsize=12, fontweight='bold', pad=8)
+            axE.grid(axis='y', which='both', alpha=0.25, linestyle='--')
+            axE.axhline(1.0, color='gray', linestyle=':', alpha=0.6)
+            axE.axhline(5.0, color='#e74c3c', linestyle='--', alpha=0.7)
+        else:
+            axE.boxplot(data_plot, patch_artist=True, tick_labels=t_labels,
+                        boxprops=dict(facecolor='#d5dbdb', color='black', alpha=0.7),
+                        medianprops=dict(color='#c0392b', linewidth=2.0))
+            for idx, d in enumerate(data_plot):
+                jit = np.random.normal(0, 0.05, size=len(d))
+                axE.scatter(np.ones(len(d))*(idx+1) + jit, d, color='#2980b9', alpha=0.45, s=20, zorder=3)
+            all_vals = np.concatenate(data_plot) if len(data_plot) > 0 else []
+            if len(all_vals) > 0:
+                y_min = np.min(all_vals)
+                y_max = np.max(all_vals)
+                y_span = max(1.0, y_max - y_min)
+                axE.set_ylim(y_min - 0.08 * y_span, y_max + 0.22 * y_span)
+                for idx, d in enumerate(data_plot):
+                    mae = np.mean(np.abs(d)) if len(d) > 0 else 0.0
+                    badge_y = y_max + 0.05 * y_span
+                    axE.text(idx + 1, badge_y,
+                             f"MAE: {mae:.2f}s", ha='center', va='bottom', fontsize=8, fontweight='bold',
+                             bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.9, edgecolor='#7f8c8d'))
+            axE.axhline(0, color='black', linestyle='--', linewidth=1.2, alpha=0.7)
+            axE.set_ylabel('Timing Error (s) [Pred - True]', fontsize=10.5, fontweight='bold')
+            axE.set_title('E. Transition Timing Accuracy', fontsize=12, fontweight='bold', pad=8)
+            axE.grid(axis='y', alpha=0.25, linestyle='--')
+            
         axE.spines['top'].set_visible(False)
         axE.spines['right'].set_visible(False)
         
@@ -1325,17 +1430,134 @@ def plot_master_evaluation_dashboard(all_true, all_raw, all_refined, all_probs, 
         axF.spines['top'].set_visible(False)
         axF.spines['right'].set_visible(False)
         
-    fig.suptitle("Rat Hunt Model - Performance & Accuracy Evaluation Dashboard", fontsize=16, fontweight='bold', y=0.98)
+    dashboard_title = "Rat Hunt Model - Performance & Accuracy Evaluation Dashboard"
+    if log_scale:
+        dashboard_title += " [Log Scale Timing]"
+    fig.suptitle(dashboard_title, fontsize=16, fontweight='bold', y=0.98)
     if save_path:
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
         if save_path.endswith('.png'):
             plt.savefig(save_path.replace('.png', '.pdf'), bbox_inches='tight')
         print(f"Master Dashboard saved: {save_path}")
+        
+        # Automatically generate log-scale version every time
+        if not log_scale and save_path.endswith('.png'):
+            log_save = save_path.replace('.png', '_log.png')
+            plot_master_evaluation_dashboard(all_true, all_raw, all_refined, all_probs, event_summary, matched_df, save_path=log_save, log_scale=True)
+            
     plt.close(fig)
 
-def export_evaluation_metrics(excel_path, frame_metrics_df, event_summary, timing_stats_df, per_video_df, matched_df):
+def build_discrepancy_audit_table(all_matched, all_unmatched_true, all_unmatched_pred, timing_threshold_sec=5.0, duration_threshold_sec=3.0):
     """
-    Exports all numerical evaluation metrics into an organized multi-sheet Excel workbook.
+    Builds a unified, actionable audit table listing all hunt discrepancies:
+    - Missed hunts (False Negatives)
+    - Spurious detections (False Positives)
+    - Matched hunts with large timing errors (>= timing_threshold_sec) or duration differences (>= duration_threshold_sec)
+    """
+    records = []
+    
+    # 1. Missed Hunts (False Negatives)
+    for t in all_unmatched_true:
+        fps = t.get('fps', 30.0)
+        t_enter = t.get('enter', np.nan)
+        t_pur = t.get('pursuit_start', np.nan)
+        t_cap = t.get('capture', np.nan)
+        t_dur = (t_cap - t_enter) / fps if pd.notna(t_cap) and pd.notna(t_enter) else np.nan
+        records.append({
+            'video': t.get('video', ''),
+            'issue_type': 'Missed Hunt (FN)',
+            'true_enter_frame': t_enter,
+            'true_pursuit_frame': t_pur,
+            'true_capture_frame': t_cap,
+            'true_duration_sec': round(t_dur, 2) if pd.notna(t_dur) else np.nan,
+            'pred_enter_frame': np.nan,
+            'pred_pursuit_frame': np.nan,
+            'pred_capture_frame': np.nan,
+            'pred_duration_sec': np.nan,
+            'enter_error_sec': np.nan,
+            'pursuit_error_sec': np.nan,
+            'capture_error_sec': np.nan,
+            'duration_diff_sec': np.nan,
+            'notes': 'Manual hunt was not detected by model'
+        })
+        
+    # 2. False Positives (Spurious Model Detections)
+    for p in all_unmatched_pred:
+        fps = p.get('fps', 30.0)
+        p_enter = p.get('enter', np.nan)
+        p_pur = p.get('pursuit', np.nan)
+        p_cap = p.get('capture', np.nan)
+        p_dur = (p_cap - p_enter) / fps if pd.notna(p_cap) and pd.notna(p_enter) else np.nan
+        records.append({
+            'video': p.get('video', ''),
+            'issue_type': 'False Positive (FP)',
+            'true_enter_frame': np.nan,
+            'true_pursuit_frame': np.nan,
+            'true_capture_frame': np.nan,
+            'true_duration_sec': np.nan,
+            'pred_enter_frame': p_enter,
+            'pred_pursuit_frame': p_pur,
+            'pred_capture_frame': p_cap,
+            'pred_duration_sec': round(p_dur, 2) if pd.notna(p_dur) else np.nan,
+            'enter_error_sec': np.nan,
+            'pursuit_error_sec': np.nan,
+            'capture_error_sec': np.nan,
+            'duration_diff_sec': np.nan,
+            'notes': 'Model detected hunt with no corresponding manual label'
+        })
+        
+    # 3. Matched Hunts with Large Timing or Duration Discrepancies
+    for m in all_matched:
+        ent_err = m.get('enter_error_sec', 0.0)
+        pur_err = m.get('pursuit_error_sec', 0.0)
+        cap_err = m.get('capture_error_sec', 0.0)
+        t_dur = m.get('true_duration_sec', 0.0)
+        p_dur = m.get('pred_duration_sec', 0.0)
+        dur_diff = abs(p_dur - t_dur)
+        
+        has_timing_err = (abs(ent_err) >= timing_threshold_sec) or (abs(cap_err) >= timing_threshold_sec) or (abs(pur_err) >= timing_threshold_sec)
+        has_dur_err = (dur_diff >= duration_threshold_sec)
+        
+        if has_timing_err or has_dur_err:
+            issues = []
+            if abs(ent_err) >= timing_threshold_sec:
+                issues.append(f"Enter err: {ent_err:+.1f}s")
+            if abs(pur_err) >= timing_threshold_sec:
+                issues.append(f"Pursuit err: {pur_err:+.1f}s")
+            if abs(cap_err) >= timing_threshold_sec:
+                issues.append(f"Capture err: {cap_err:+.1f}s")
+            if has_dur_err:
+                issues.append(f"Duration diff: {dur_diff:.1f}s")
+                
+            issue_label = "Timing & Duration Error" if (has_timing_err and has_dur_err) else ("Large Timing Error" if has_timing_err else "Large Duration Discrepancy")
+            
+            records.append({
+                'video': m.get('video', ''),
+                'issue_type': issue_label,
+                'true_enter_frame': m.get('true_enter_frame'),
+                'true_pursuit_frame': m.get('true_pursuit_frame'),
+                'true_capture_frame': m.get('true_capture_frame'),
+                'true_duration_sec': round(t_dur, 2),
+                'pred_enter_frame': m.get('pred_enter_frame'),
+                'pred_pursuit_frame': m.get('pred_pursuit_frame'),
+                'pred_capture_frame': m.get('pred_capture_frame'),
+                'pred_duration_sec': round(p_dur, 2),
+                'enter_error_sec': round(ent_err, 2),
+                'pursuit_error_sec': round(pur_err, 2),
+                'capture_error_sec': round(cap_err, 2),
+                'duration_diff_sec': round(dur_diff, 2),
+                'notes': "; ".join(issues)
+            })
+            
+    df = pd.DataFrame(records)
+    if len(df) > 0:
+        df['sort_frame'] = df['true_enter_frame'].fillna(df['pred_enter_frame'])
+        df = df.sort_values(by=['video', 'sort_frame']).drop(columns=['sort_frame']).reset_index(drop=True)
+    return df
+
+def export_evaluation_metrics(excel_path, frame_metrics_df, event_summary, timing_stats_df, per_video_df, matched_df, discrepancies_df=None):
+    """
+    Exports all numerical evaluation metrics and the discrepancies audit table into an organized multi-sheet Excel workbook.
     """
     try:
         with pd.ExcelWriter(excel_path) as writer:
@@ -1352,19 +1574,24 @@ def export_evaluation_metrics(excel_path, frame_metrics_df, event_summary, timin
                 {'Metric': 'True Positives (Detected Hunts)', 'Value': event_summary['true_positives']},
                 {'Metric': 'False Positives (False Alarms)', 'Value': event_summary['false_positives']},
                 {'Metric': 'False Negatives (Missed Hunts)', 'Value': event_summary['false_negatives']},
+                {'Metric': 'Discrepancies Flagged for Review', 'Value': len(discrepancies_df) if discrepancies_df is not None else 0},
             ]
             pd.DataFrame(summary_data).to_excel(writer, sheet_name='Summary', index=False)
             
-            # Sheet 2: Frame-Level Metrics
+            # Sheet 2: Discrepancies & Audit Log (flagged for review)
+            if discrepancies_df is not None and len(discrepancies_df) > 0:
+                discrepancies_df.to_excel(writer, sheet_name='Discrepancies_Audit', index=False)
+                
+            # Sheet 3: Frame-Level Metrics
             frame_metrics_df.to_excel(writer, sheet_name='Frame_Metrics')
             
-            # Sheet 3: Timing Accuracy
+            # Sheet 4: Timing Accuracy
             timing_stats_df.to_excel(writer, sheet_name='Timing_Accuracy', index=False)
             
-            # Sheet 4: Per-Video Breakdown
+            # Sheet 5: Per-Video Breakdown
             per_video_df.to_excel(writer, sheet_name='Per_Video_Breakdown', index=False)
             
-            # Sheet 5: Matched Hunts Raw Detail
+            # Sheet 6: Matched Hunts Raw Detail
             matched_df.to_excel(writer, sheet_name='Matched_Hunts_Detail', index=False)
             
         print(f"Metrics report exported: {excel_path}")
@@ -1387,7 +1614,9 @@ def batch_process_and_evaluate(
     plot_subdir="plots",
     prob_subdir="probs",
     eval_subdir="evaluation_results",
-    rerun_inference=True
+    rerun_inference=True,
+    timing_threshold_sec=5.0,
+    duration_threshold_sec=3.0
 ):
     """
     Runs batch inference on a DLC video folder (if rerun_inference=True or files missing),
@@ -1592,11 +1821,25 @@ def batch_process_and_evaluate(
     plot_master_evaluation_dashboard(all_true, all_raw, all_refined, all_probs, event_summary, matched_df, save_path=fig_dash_path)
     
     # -------------------------------------------------------------
-    # Step 5: Export Metrics to Excel
+    # Step 5: Build Discrepancy Audit Table & Export Reports
     # -------------------------------------------------------------
     print("\n=======================================================")
-    print("  STEP 5: Exporting Numerical Reports to Excel")
+    print("  STEP 5: Generating Discrepancy Audit Log & Excel Reports")
     print("=======================================================")
+    
+    discrepancies_df = build_discrepancy_audit_table(
+        all_matched=all_matched,
+        all_unmatched_true=all_unmatched_true,
+        all_unmatched_pred=all_unmatched_pred,
+        timing_threshold_sec=timing_threshold_sec,
+        duration_threshold_sec=duration_threshold_sec
+    )
+    
+    # Save standalone CSV audit log
+    audit_csv_path = os.path.join(eval_dir, "discrepancies_audit.csv")
+    discrepancies_df.to_csv(audit_csv_path, index=False)
+    print(f"Discrepancy audit log exported: {audit_csv_path}")
+    
     excel_report_path = os.path.join(eval_dir, "evaluation_metrics.xlsx")
     export_evaluation_metrics(
         excel_path=excel_report_path,
@@ -1604,7 +1847,8 @@ def batch_process_and_evaluate(
         event_summary=event_summary,
         timing_stats_df=timing_stats_df,
         per_video_df=per_video_df,
-        matched_df=matched_df
+        matched_df=matched_df,
+        discrepancies_df=discrepancies_df
     )
     
     # -------------------------------------------------------------
@@ -1623,7 +1867,12 @@ def batch_process_and_evaluate(
     if len(timing_stats_df) > 0:
         for _, row in timing_stats_df.iterrows():
             print(f"Timing MAE ({row['Transition']:<14}) : {row['MAE_Seconds']:.2f} sec (Median: {row['Median_Error_Seconds']:+.2f}s)")
-    print(f"\nAll plots and Excel report saved to: {eval_dir}")
+    print(f"Flagged Discrepancies        : {len(discrepancies_df)} events for review -> {os.path.basename(audit_csv_path)}")
+    if len(discrepancies_df) > 0:
+        issue_counts = discrepancies_df['issue_type'].value_counts().to_dict()
+        breakdown = ", ".join([f"{k}: {v}" for k, v in issue_counts.items()])
+        print(f"  Breakdown                  : {breakdown}")
+    print(f"\nAll plots, audit log, and Excel report saved to: {eval_dir}")
     print("="*65 + "\n")
     
     return {
@@ -1632,12 +1881,15 @@ def batch_process_and_evaluate(
         'timing_stats': timing_stats_df,
         'per_video': per_video_df,
         'matched_hunts': matched_df,
+        'discrepancies': discrepancies_df,
         'eval_dir': eval_dir,
         'figures': {
             'dashboard': fig_dash_path,
+            'dashboard_log': fig_dash_path.replace('.png', '_log.png'),
             'confusion_matrices': fig_cm_path,
             'roc_pr_curves': fig_roc_path,
             'event_detection': fig_det_path,
+            'event_detection_log': fig_det_path.replace('.png', '_log.png'),
             'duration_correlations': fig_corr_path,
             'per_video': fig_vid_path
         }
@@ -1676,7 +1928,7 @@ if __name__ == "__main__":
         plot_subdir="plots",
         prob_subdir="probs",
         eval_subdir="evaluation_results",
-        rerun_inference=True # Set to False to quickly re-plot without rerunning inference
+        rerun_inference=False # Set to False to quickly re-plot without rerunning inference
     )
 
     

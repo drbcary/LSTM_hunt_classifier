@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                                QHBoxLayout, QPushButton, QLabel, QFileDialog, QMessageBox, 
-                               QDoubleSpinBox)
+                               QDoubleSpinBox, QScrollBar)
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QImage, QPixmap, QPainter, QColor, QPen, QShortcut, QKeySequence
 
@@ -26,6 +26,7 @@ class TimelineWidget(QWidget):
         
         self.selection_start = -1
         self.selection_end = -1
+        self.press_x = 0
         
         self.zoom = 1.0
         self.offset_x = 0.0 # Pixels
@@ -51,6 +52,7 @@ class TimelineWidget(QWidget):
         self.zoom = 1.0
         self.offset_x = 0.0
         self.update()
+        self.update_scrollbar()
         
     def set_current_frame(self, frame):
         self.current_frame = frame
@@ -66,6 +68,16 @@ class TimelineWidget(QWidget):
         f = ((x - self.offset_x) / w) * self.total_frames
         return int(f)
         
+    def has_selection(self):
+        return (self.selection_start != -1 and 
+                self.selection_end != -1 and 
+                self.selection_start != self.selection_end)
+                
+    def clear_selection(self):
+        self.selection_start = -1
+        self.selection_end = -1
+        self.update()
+        
     def center_on_frame(self, frame):
         w = self.rect().width() * self.zoom
         mid = self.rect().width() / 2
@@ -74,12 +86,75 @@ class TimelineWidget(QWidget):
         min_offset = -(self.rect().width() * self.zoom - self.rect().width())
         self.offset_x = max(min_offset, min(0.0, self.offset_x))
         self.update()
+        self.update_scrollbar()
         
     def ensure_cursor_visible(self, frame):
         x = self.get_x_for_frame(frame)
         mid = self.rect().width() / 2
         if x > mid or x < 0:
             self.center_on_frame(frame)
+            
+    def zoom_by(self, factor, center_x=None):
+        if center_x is None:
+            center_x = self.rect().width() / 2
+        frame_at_center = self.get_frame_for_x(center_x)
+        self.zoom = max(1.0, min(100.0, self.zoom * factor))
+        
+        w = self.rect().width() * self.zoom
+        new_x = (frame_at_center / self.total_frames) * w
+        self.offset_x = center_x - new_x
+        
+        min_offset = -(w - self.rect().width())
+        self.offset_x = max(min_offset, min(0.0, self.offset_x))
+        self.update()
+        self.update_scrollbar()
+        
+    def scroll_to_frame(self, first_frame):
+        w_vis = self.rect().width()
+        if w_vis <= 0 or self.total_frames <= 1:
+            return
+        w_total = w_vis * self.zoom
+        new_offset = -(first_frame / self.total_frames) * w_total
+        min_offset = -(w_total - w_vis)
+        self.offset_x = max(min_offset, min(0.0, new_offset))
+        self.update()
+        
+    def update_scrollbar(self):
+        win = self.window()
+        if not win or not hasattr(win, 'scrollbar') or win.scrollbar is None:
+            return
+        if self.total_frames <= 1 or self.zoom <= 1.0001:
+            win._syncing_scrollbar = True
+            win.scrollbar.setRange(0, 0)
+            win.scrollbar.setEnabled(False)
+            win._syncing_scrollbar = False
+            return
+            
+        w_vis = self.rect().width()
+        if w_vis <= 0:
+            return
+            
+        frames_visible = self.total_frames / self.zoom
+        page_step = max(1, int(round(frames_visible)))
+        max_scroll = max(0, self.total_frames - page_step)
+        
+        w_total = w_vis * self.zoom
+        current_first_frame = int(round((-self.offset_x / w_total) * self.total_frames))
+        current_first_frame = max(0, min(max_scroll, current_first_frame))
+        
+        win._syncing_scrollbar = True
+        win.scrollbar.setEnabled(True)
+        win.scrollbar.setRange(0, max_scroll)
+        win.scrollbar.setPageStep(page_step)
+        win.scrollbar.setSingleStep(max(1, int(page_step / 10)))
+        win.scrollbar.setValue(current_first_frame)
+        win._syncing_scrollbar = False
+        
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        min_offset = -(self.rect().width() * self.zoom - self.rect().width())
+        self.offset_x = max(min_offset, min(0.0, self.offset_x))
+        self.update_scrollbar()
 
     def _draw_bar(self, painter, label_array, w, y_pos, bar_h):
         if label_array is None or len(label_array) == 0:
@@ -166,12 +241,15 @@ class TimelineWidget(QWidget):
                     painter.drawLine(pts[i][0], pts[i][1], pts[i+1][0], pts[i+1][1])
                     
         # 4. Draw Selection
-        if self.selection_start != -1 and self.selection_end != -1:
+        if self.has_selection():
             s = min(self.selection_start, self.selection_end)
             e = max(self.selection_start, self.selection_end)
             x1 = int((s / self.total_frames) * w + self.offset_x)
-            x2 = int((e / self.total_frames) * w + self.offset_x)
-            painter.fillRect(x1, 0, x2 - x1, h, QColor(0, 0, 255, 80)) 
+            x2 = int(((e + 1) / self.total_frames) * w + self.offset_x)
+            painter.fillRect(x1, 0, max(2, x2 - x1), h, QColor(0, 120, 255, 90))
+            painter.setPen(QPen(QColor(0, 160, 255, 220), 1.5))
+            painter.drawLine(x1, 0, x1, h)
+            painter.drawLine(x2, 0, x2, h) 
             
         # 5. Draw Playhead
         x = int(self.get_x_for_frame(self.current_frame))
@@ -180,17 +258,7 @@ class TimelineWidget(QWidget):
         
     def wheelEvent(self, event):
         zoom_factor = 1.2 if event.angleDelta().y() > 0 else 1.0 / 1.2
-        mx = event.position().x()
-        frame_at_mouse = self.get_frame_for_x(mx)
-        
-        self.zoom = max(1.0, min(100.0, self.zoom * zoom_factor))
-        
-        new_x_for_frame = (frame_at_mouse / self.total_frames) * (self.rect().width() * self.zoom)
-        self.offset_x = mx - new_x_for_frame
-        
-        min_offset = -(self.rect().width() * self.zoom - self.rect().width())
-        self.offset_x = max(min_offset, min(0.0, self.offset_x))
-        self.update()
+        self.zoom_by(zoom_factor, event.position().x())
         
     def mousePressEvent(self, event):
         if event.button() == Qt.RightButton or event.button() == Qt.MiddleButton:
@@ -198,10 +266,17 @@ class TimelineWidget(QWidget):
             self.last_mouse_x = event.position().x()
         elif event.button() == Qt.LeftButton:
             if self.labels is not None:
-                frame = max(0, min(self.total_frames - 1, self.get_frame_for_x(event.position().x())))
+                self.press_x = event.position().x()
+                frame = max(0, min(self.total_frames - 1, self.get_frame_for_x(self.press_x)))
                 self.selection_start = frame
                 self.selection_end = frame
-                self.window().set_frame(frame)
+                
+                # Stop continuous painting brush if clicking to select/seek
+                win = self.window()
+                if hasattr(win, 'active_paint_label'):
+                    win.active_paint_label = None
+                    
+                win.set_frame(frame)
                 self.update()
             
     def mouseMoveEvent(self, event):
@@ -212,6 +287,7 @@ class TimelineWidget(QWidget):
             self.offset_x = max(min_offset, min(0.0, self.offset_x))
             self.last_mouse_x = event.position().x()
             self.update()
+            self.update_scrollbar()
         elif self.selection_start != -1 and event.buttons() & Qt.LeftButton:
             if self.labels is not None:
                 frame = max(0, min(self.total_frames - 1, self.get_frame_for_x(event.position().x())))
@@ -220,7 +296,14 @@ class TimelineWidget(QWidget):
                 self.update()
                 
     def mouseReleaseEvent(self, event):
-        self.is_panning = False
+        if event.button() in [Qt.RightButton, Qt.MiddleButton]:
+            self.is_panning = False
+        elif event.button() == Qt.LeftButton:
+            # If user simply clicked without dragging (< 4 pixels movement), clear selection
+            if abs(event.position().x() - getattr(self, 'press_x', 0)) < 4:
+                self.selection_start = -1
+                self.selection_end = -1
+                self.update()
 
 
 class ReviewGUI(QMainWindow):
@@ -307,6 +390,7 @@ class ReviewGUI(QMainWindow):
         self.spin_skip.setValue(1.0)
         self.spin_skip.setSingleStep(0.5)
         self.spin_skip.setFocusPolicy(Qt.NoFocus) # No focus means no keyboard traps!
+        self.spin_skip.valueChanged.connect(self.update_skip_step)
         
         self.btn_save = QPushButton("Save Refined Labels")
         self.btn_save.clicked.connect(self.save_labels)
@@ -325,8 +409,43 @@ class ReviewGUI(QMainWindow):
         self.timeline = TimelineWidget(self)
         layout.addWidget(self.timeline)
         
+        # Navigation Scrollbar (below colored label bars)
+        self.scrollbar = QScrollBar(Qt.Horizontal)
+        self.scrollbar.setFocusPolicy(Qt.NoFocus)
+        self.scrollbar.setEnabled(False)
+        self.scrollbar.setRange(0, 0)
+        self.scrollbar.setTracking(True)
+        self.scrollbar.valueChanged.connect(self.on_scrollbar_changed)
+        self.scrollbar.setStyleSheet("""
+            QScrollBar:horizontal {
+                height: 16px;
+                background: #2b2b2b;
+                margin: 2px 0px 4px 0px;
+                border-radius: 4px;
+            }
+            QScrollBar::handle:horizontal {
+                background: #606060;
+                min-width: 30px;
+                border-radius: 4px;
+            }
+            QScrollBar::handle:horizontal:hover {
+                background: #858585;
+            }
+            QScrollBar::handle:horizontal:pressed {
+                background: #a8a8a8;
+            }
+            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+                width: 0px;
+                background: none;
+            }
+            QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
+                background: none;
+            }
+        """)
+        layout.addWidget(self.scrollbar)
+        
         # Instructions
-        inst = QLabel("<b>Controls:</b> Space=Play/Pause, Left/Right Arrow=Skip by seconds (Hold to repeat). <br><b>Timeline:</b> Scroll wheel to zoom, Middle/Right-click drag to pan. <br><b>Live Editing:</b> Tap <b>0</b>=Bg, <b>1</b>=Cricket Present, <b>2</b>=Pursuit, <b>3</b>=Eat to toggle continuous painting. Tap again to revert to No Change.")
+        inst = QLabel("<b>Controls:</b> Space=Play/Pause, &lt; / &gt; (or , / .)=Step 1 frame, Left/Right Arrow=Skip by seconds (Hold to repeat). <br><b>Timeline & Window Navigation:</b> Drag bottom scrollbar to scroll window left/right independently of frame. Scroll wheel or +/- to zoom. Middle/Right-click drag to pan. Click on timeline to seek playhead. <br><b>Editing:</b> Highlight range + press <b>0-3</b> to relabel section (selection stays highlighted). With no selection, <b>0-3</b> toggles continuous painting (0=Bg, 1=Cricket, 2=Pursuit, 3=Eat). Escape=Clear selection.")
         inst.setStyleSheet("font-size: 13px;")
         layout.addWidget(inst)
         
@@ -334,32 +453,70 @@ class ReviewGUI(QMainWindow):
         if event.type() == event.Type.KeyPress:
             key = event.key()
             
-            # Allow AutoRepeat for Left/Right
+            # Allow AutoRepeat for Left/Right and Comma/Period (< and >)
             if key == Qt.Key_Right:
                 self.skip(1)
                 return True
             elif key == Qt.Key_Left:
                 self.skip(-1)
                 return True
+            elif key in [Qt.Key_Comma, Qt.Key_Less]:
+                self.step_frame(-1)
+                return True
+            elif key in [Qt.Key_Period, Qt.Key_Greater]:
+                self.step_frame(1)
+                return True
                 
             if not event.isAutoRepeat():
-                if key == Qt.Key_Space:
+                if key == Qt.Key_Escape:
+                    if self.timeline.has_selection():
+                        self.timeline.clear_selection()
+                        return True
+                elif key == Qt.Key_Space:
                     self.toggle_play()
                     return True
                 elif key in [Qt.Key_0, Qt.Key_QuoteLeft]:
-                    self.toggle_painting(0)
+                    self.handle_label_key(0)
                     return True
                 elif key == Qt.Key_1:
-                    self.toggle_painting(1)
+                    self.handle_label_key(1)
                     return True
                 elif key == Qt.Key_2:
-                    self.toggle_painting(2)
+                    self.handle_label_key(2)
                     return True
                 elif key in [Qt.Key_3, Qt.Key_4]:
-                    self.toggle_painting(3)
+                    self.handle_label_key(3)
+                    return True
+                elif key in [Qt.Key_Plus, Qt.Key_Equal]:
+                    self.timeline.zoom_by(1.25)
+                    return True
+                elif key in [Qt.Key_Minus, Qt.Key_Underscore]:
+                    self.timeline.zoom_by(1.0 / 1.25)
                     return True
         return super().eventFilter(obj, event)
         
+    def handle_label_key(self, val):
+        if self.timeline.has_selection():
+            self.apply_label(val)
+        else:
+            self.toggle_painting(val)
+            
+    def step_frame(self, delta):
+        if not self.cap or self.total_frames <= 0: return
+        if self.is_playing:
+            self.toggle_play()
+        self.set_frame(self.current_frame + delta)
+        self.timeline.ensure_cursor_visible(self.current_frame)
+        
+    def update_skip_step(self, val):
+        if hasattr(self, 'scrollbar') and self.video_fps > 0:
+            self.scrollbar.setPageStep(max(1, int(self.video_fps * val)))
+            
+    def on_scrollbar_changed(self, value):
+        if getattr(self, '_syncing_scrollbar', False):
+            return
+        self.timeline.scroll_to_frame(value)
+            
     def toggle_painting(self, val):
         if self.active_paint_label == val:
             self.active_paint_label = None # Re-clicking same label stops painting entirely (No Change)
@@ -381,13 +538,14 @@ class ReviewGUI(QMainWindow):
         self.set_frame(self.current_frame + direction * skip_frames)
         
     def apply_label(self, val):
-        if self.labels is not None and self.timeline.selection_start != -1:
+        if self.labels is not None and self.timeline.has_selection():
             s = min(self.timeline.selection_start, self.timeline.selection_end)
             e = max(self.timeline.selection_start, self.timeline.selection_end)
+            s = max(0, min(len(self.labels) - 1, s))
+            e = max(0, min(len(self.labels) - 1, e))
             self.labels[s:e+1] = val
             
-            self.timeline.selection_start = -1
-            self.timeline.selection_end = -1
+            # Keep selection highlighted as requested; do not clear selection
             self.timeline.update()
             self.set_frame(self.current_frame)
         
@@ -403,6 +561,10 @@ class ReviewGUI(QMainWindow):
             
         self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
         self.video_fps = self.cap.get(cv2.CAP_PROP_FPS)
+        
+        # Configure navigation scrollbar
+        self.timeline.total_frames = max(1, self.total_frames)
+        self.timeline.update_scrollbar()
         
         folder = os.path.dirname(path)
         base = os.path.basename(path)
@@ -825,9 +987,21 @@ class ReviewGUI(QMainWindow):
         
         for s, e in zip(starts, ends):
             val = lbls[s]
+            
+            # Detect back-to-back hunt: transition from Eating (3) directly to Stalking (1) or Pursuit (2)
+            if in_hunt and current_event and current_event['capture'] != -1 and val in (1, 2):
+                current_event['capture_end'] = s
+                if current_event['pursuit'] == -1:
+                    current_event['pursuit'] = current_event['enter']
+                events.append(current_event)
+                # Begin new hunt immediately
+                current_event = {'enter': s, 'pursuit': s if val == 2 else -1, 'capture': -1, 'capture_end': -1}
+                in_hunt = True
+                continue
+
             if val != 0 and not in_hunt:
                 in_hunt = True
-                current_event = {'enter': s, 'pursuit': -1, 'capture': -1, 'capture_end': -1}
+                current_event = {'enter': s, 'pursuit': s if val == 2 else -1, 'capture': -1, 'capture_end': -1}
                 
             if in_hunt:
                 if val == 1 and current_event['enter'] == -1:

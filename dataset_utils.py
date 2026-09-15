@@ -686,14 +686,15 @@ def calculate_empirical_transition_matrix(pairs=None):
                     else:
                         counts[2, 0] += 1
                         
-    # Add priors for "aborting" a hunt, so the HMM doesn't get trapped if it enters Stalking 
-    # but the neural net strongly predicts it went back to Background.
+    # Add priors for "aborting" a hunt or immediately initiating a back-to-back hunt
     num_hunts = sum(len(p['hunts']) for p in pairs)
-    counts[1, 0] += max(1, num_hunts * 0.1) # 10% chance to abort stalk
-    counts[2, 0] += max(1, num_hunts * 0.05) # 5% chance to abort pursuit
+    counts[1, 0] += max(1, num_hunts * 0.1)  # 10% chance to abort stalk to background
+    counts[2, 0] += max(1, num_hunts * 0.05) # 5% chance to abort pursuit to background
+    counts[3, 1] += max(1, num_hunts * 0.02) # 2% chance to transition directly from eating to next stalk
+    counts[3, 2] += max(1, num_hunts * 0.01) # 1% chance to transition directly from eating to next pursuit
     
-    # Strictly forbid chronological violations
-    forbidden = [(3,1), (3,2), (2,1)]
+    # Strictly forbid chronological violations within an active hunt (pursuit back to stalking)
+    forbidden = [(2, 1)]
     for i in range(4):
         for j in range(4):
             if (i, j) in forbidden:
