@@ -421,59 +421,135 @@ def get_video_params(dlc_csv_path, verbose=False):
     if verbose: print(f"Warning: Could not read video properties for {base_name}. Using defaults.")
     return DEFAULT_WIDTH, DEFAULT_HEIGHT, DEFAULT_FPS
 
+def hunts_to_sequence(hunts, num_frames):
+    """
+    Converts a list of hunt dictionaries to a 1D numpy array of frame labels:
+    0: Background, 1: Stalking, 2: Pursuit, 3: Eating
+    """
+    seq = np.zeros(num_frames, dtype=int)
+    for row in hunts:
+        enter = row['enter']
+        capture = row['capture']
+        pursuit_start = row['pursuit_start']
+        cons_end = row.get('consumption_end')
+        
+        eating_end = cons_end if cons_end is not None else capture + EATING_BUFFER
+        
+        enter = max(0, min(num_frames, enter))
+        pursuit_start = max(enter, min(num_frames, pursuit_start))
+        capture = max(pursuit_start, min(num_frames, capture))
+        eating_end = max(capture, min(num_frames, eating_end))
+        
+        if pursuit_start > enter: seq[enter:pursuit_start] = 1
+        if capture > pursuit_start: seq[pursuit_start:capture] = 2
+        if eating_end > capture: seq[capture:eating_end] = 3
+    return seq
+
 def parse_lucas_labels(label_path):
-    df = pd.read_excel(label_path)
-    valid_hunts = df[df['Include?'] == 'Include'].sort_values('Enter_Frame')
+    """
+    Parses a Lucas/Standard analyzed label spreadsheet (.xlsx or .csv).
+    Returns a list of hunt dictionaries.
+    """
+    if label_path.endswith('.csv'):
+        df = pd.read_csv(label_path)
+    else:
+        df = pd.read_excel(label_path)
+        
+    df.columns = df.columns.astype(str).str.strip()
+    if 'Include?' in df.columns:
+        valid_hunts = df[df['Include?'] != 'Exclude'].sort_values('Enter_Frame')
+    else:
+        valid_hunts = df.sort_values('Enter_Frame')
+        
     hunts = []
     for _, row in valid_hunts.iterrows():
+        if pd.isna(row.get('Enter_Frame')) or pd.isna(row.get('Capture_Frame')):
+            continue
         enter = int(row['Enter_Frame'])
         capture = int(row['Capture_Frame'])
-        latency = int(row['Latency_to_Attack_Frames'])
+        
+        if 'Pursuit_Frame' in row and pd.notna(row['Pursuit_Frame']):
+            pursuit_start = int(row['Pursuit_Frame'])
+        elif 'Pursuit_Start_Frame' in row and pd.notna(row['Pursuit_Start_Frame']):
+            pursuit_start = int(row['Pursuit_Start_Frame'])
+        elif 'Latency_to_Attack_Frames' in row and pd.notna(row['Latency_to_Attack_Frames']):
+            pursuit_start = enter + int(row['Latency_to_Attack_Frames'])
+        else:
+            pursuit_start = enter
+            
+        cons_end = None
+        if 'Consumption_End_Frame' in row and pd.notna(row['Consumption_End_Frame']):
+            cons_end = int(row['Consumption_End_Frame'])
+            
         hunts.append({
             'enter': enter,
             'capture': capture,
-            'pursuit_start': enter + latency,
-            'consumption_end': None
+            'pursuit_start': pursuit_start,
+            'consumption_end': cons_end
         })
     return hunts
 
+def parse_dan_label_file(file_path):
+    """
+    Parses a single Dan label file (.xlsx or .csv).
+    Animal name appears once per file — grabs it from the first non-NaN entry.
+    Returns:
+        dict: mapping (animal_upper, session_int) -> list of hunt dictionaries
+    """
+    dan_hunts = {}
+    if file_path.endswith('.csv'):
+        df = pd.read_csv(file_path)
+    else:
+        df = pd.read_excel(file_path)
+        
+    df.columns = df.columns.astype(str).str.strip()
+    if not all(col in df.columns for col in ['Animal', 'Day', 'Session']):
+        return dan_hunts
+        
+    animal_series = df['Animal'].dropna()
+    if animal_series.empty:
+        return dan_hunts
+    animal = str(animal_series.iloc[0]).strip().upper()
+    
+    for _, row in df.iterrows():
+        if pd.isna(row.get('On')) or pd.isna(row.get('Capture')):
+            continue
+            
+        try:
+            day = int(row['Day'])
+            session = int(row['Session'])
+        except (ValueError, TypeError):
+            continue
+            
+        key = (animal, session)
+        if key not in dan_hunts:
+            dan_hunts[key] = []
+            
+        hunts = {
+            'enter': int(row['On']),
+            'pursuit_start': int(row['Approach Start']) if pd.notna(row.get('Approach Start')) else int(row['On']),
+            'capture': int(row['Capture']),
+            'consumption_end': int(row['Consumption']) if pd.notna(row.get('Consumption')) else None,
+        }
+        dan_hunts[key].append(hunts)
+        
+    return dan_hunts
+
 def load_dan_labels(label_dir):
+    """
+    Scans a directory for Dan label files (.xlsx, .csv) and aggregates all hunts.
+    Returns dict mapping (animal, session) -> list of hunt dictionaries.
+    """
     dan_hunts = {}
     label_files = glob.glob(os.path.join(label_dir, '*.xlsx')) + glob.glob(os.path.join(label_dir, '*.csv'))
     
     for lf in label_files:
         try:
-            if lf.endswith('.csv'):
-                df = pd.read_csv(lf)
-            else:
-                df = pd.read_excel(lf)
-            if not all(col in df.columns for col in ['Animal', 'Day', 'Session']): continue
-            
-            # Animal name appears once per file — grab it from the first non-NaN entry
-            animal_series = df['Animal'].dropna()
-            if animal_series.empty: continue
-            animal = str(animal_series.iloc[0]).strip()
-            
-            for _, row in df.iterrows():
-                # Skip rows without frame data
-                if pd.isna(row.get('On')) or pd.isna(row.get('Capture')):
-                    continue
-                
-                day = int(row['Day'])
-                session = int(row['Session'])
-                
-                key = (animal, session)
+            file_hunts = parse_dan_label_file(lf)
+            for key, val in file_hunts.items():
                 if key not in dan_hunts:
                     dan_hunts[key] = []
-                    
-                hunts = {
-                    'enter': int(row['On']),
-                    'pursuit_start': int(row['Approach Start']) if pd.notna(row.get('Approach Start')) else int(row['On']),
-                    'capture': int(row['Capture']),
-                    'consumption_end': int(row['Consumption']) if pd.notna(row.get('Consumption')) else None,
-                }
-                
-                dan_hunts[key].append(hunts)
+                dan_hunts[key].extend(val)
         except Exception as e:
             if VERBOSE: print(f"Error reading {lf}: {e}")
             

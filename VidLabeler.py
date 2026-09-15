@@ -4,6 +4,12 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
 import os
 
+# Pull in DLC thresholds from dataset_utils
+import dataset_utils
+
+rat_thresh = dataset_utils.RAT_LIKELIHOOD_THRESH
+cricket_thresh = dataset_utils.CRICKET_LIKELIHOOD_THRESH
+
 # ==========================================
 # Configuration
 # ==========================================
@@ -17,7 +23,8 @@ CLASS_COLORS_CV2 = [
     (0, 128, 0)      # Green
 ]
 
-def render_plot_frame_transparent(probs, current_frame_idx, trailing_frames, width_px, height_px):
+def render_plot_frame_transparent(probs, current_frame_idx, trailing_frames, width_px, height_px,
+                                  plot_poops=False, poop_dist_thresh=None):
     """
     Renders a transparent overlay plot using pure OpenCV for extreme performance.
     """
@@ -93,6 +100,12 @@ def render_plot_frame_transparent(probs, current_frame_idx, trailing_frames, wid
         cv2.putText(img, cls_name, (leg_x + 20, leg_y), font, 0.3, font_color, 1, cv2.LINE_AA)
         leg_y += 12
 
+    if plot_poops:
+        # Amber/Brown indicator for poop mask
+        cv2.line(img, (leg_x, leg_y - 4), (leg_x + 15, leg_y - 4), (150, 75, 0, 230), 2, cv2.LINE_AA)
+        p_label = f"Poop Mask ({poop_dist_thresh}px)" if poop_dist_thresh is not None else "Poop Mask"
+        cv2.putText(img, p_label, (leg_x + 20, leg_y), font, 0.3, font_color, 1, cv2.LINE_AA)
+
     return img
 
 def overlay_transparent(background, overlay, x, y):
@@ -120,7 +133,7 @@ def overlay_transparent(background, overlay, x, y):
 def create_hunting_video_clip(video_path, probs, preds, start_frame, end_frame, output_path,
                               trailing_frames=150, dlc_path=None, circle_radius=4, dlc_thresh=0.7,
                               show_confidence=True, include_blurry_cricket=False, filter_poops=True,
-                              poop_dist_thresh=20, plot_poops=False):
+                              poop_dist_thresh=20, poop_thresh=0.75, plot_poops=False):
 
     print(f"Generating video clip: {output_path}")
     print(f"Frame Range: {start_frame} to {end_frame}")
@@ -129,13 +142,16 @@ def create_hunting_video_clip(video_path, probs, preds, start_frame, end_frame, 
     dlc_confs = None
     if dlc_path is not None:
         import dataset_utils
-        res = dataset_utils.extract_dlc_tracking_data(dlc_path, rat_thresh=dlc_thresh, cricket_thresh=dlc_thresh,
+        res = dataset_utils.extract_dlc_tracking_data(dlc_path, rat_thresh=rat_thresh, cricket_thresh=cricket_thresh,
                                                       interp_limit=0, include_blurry_cricket=include_blurry_cricket,
-                                                      filter_poops=filter_poops, poop_dist_thresh=poop_dist_thresh)
+                                                      filter_poops=filter_poops, poop_dist_thresh=poop_dist_thresh,
+                                                      poop_thresh=poop_thresh)
         if res is not None:
             dlc_data = res
             
         poop_data = None
+        all_poop_x = []
+        all_poop_y = []
         if show_confidence or plot_poops:
             import pandas as pd
             try:
@@ -151,9 +167,8 @@ def create_hunting_video_clip(video_path, probs, preds, start_frame, end_frame, 
                         bc_vals = df[scorer]['blurry_cricket']['likelihood'].values.copy()
                         
                         if filter_poops:
-                            # Use poop_thresh=0.75 to match the extraction logic
-                            c_vals = dataset_utils.apply_poop_penalty(df, scorer, df[scorer]['cricket']['x'], df[scorer]['cricket']['y'], c_vals, poop_thresh=0.75, poop_dist_thresh=poop_dist_thresh, cricket_thresh=dlc_thresh)
-                            bc_vals = dataset_utils.apply_poop_penalty(df, scorer, df[scorer]['blurry_cricket']['x'], df[scorer]['blurry_cricket']['y'], bc_vals, poop_thresh=0.75, poop_dist_thresh=poop_dist_thresh, cricket_thresh=dlc_thresh)
+                            c_vals = dataset_utils.apply_poop_penalty(df, scorer, df[scorer]['cricket']['x'], df[scorer]['cricket']['y'], c_vals, poop_thresh=poop_thresh, poop_dist_thresh=poop_dist_thresh, cricket_thresh=dlc_thresh)
+                            bc_vals = dataset_utils.apply_poop_penalty(df, scorer, df[scorer]['blurry_cricket']['x'], df[scorer]['blurry_cricket']['y'], bc_vals, poop_thresh=poop_thresh, poop_dist_thresh=poop_dist_thresh, cricket_thresh=dlc_thresh)
                             
                         cricket_conf = np.maximum(c_vals, bc_vals)
                         is_blurry = bc_vals > c_vals
@@ -161,7 +176,7 @@ def create_hunting_video_clip(video_path, probs, preds, start_frame, end_frame, 
                         cricket_conf = df[scorer]['cricket']['likelihood'].values.copy()
                         
                         if filter_poops:
-                            cricket_conf = dataset_utils.apply_poop_penalty(df, scorer, df[scorer]['cricket']['x'], df[scorer]['cricket']['y'], cricket_conf, poop_thresh=0.75, poop_dist_thresh=poop_dist_thresh, cricket_thresh=dlc_thresh)
+                            cricket_conf = dataset_utils.apply_poop_penalty(df, scorer, df[scorer]['cricket']['x'], df[scorer]['cricket']['y'], cricket_conf, poop_thresh=poop_thresh, poop_dist_thresh=poop_dist_thresh, cricket_thresh=dlc_thresh)
                             
                         is_blurry = np.zeros_like(cricket_conf, dtype=bool)
                     
@@ -180,12 +195,19 @@ def create_hunting_video_clip(video_path, probs, preds, start_frame, end_frame, 
                     if poop_parts:
                         poop_data = []
                         for p_part in poop_parts:
+                            px_vals = df[scorer][p_part]['x'].values
+                            py_vals = df[scorer][p_part]['y'].values
+                            p_conf_vals = df[scorer][p_part]['likelihood'].values
                             poop_data.append({
                                 'name': p_part,
-                                'x': df[scorer][p_part]['x'].values,
-                                'y': df[scorer][p_part]['y'].values,
-                                'conf': df[scorer][p_part]['likelihood'].values
+                                'x': px_vals,
+                                'y': py_vals,
+                                'conf': p_conf_vals
                             })
+                            valid = (p_conf_vals > poop_thresh) & ~np.isnan(px_vals) & ~np.isnan(py_vals)
+                            if np.any(valid):
+                                all_poop_x.extend(px_vals[valid])
+                                all_poop_y.extend(py_vals[valid])
             except Exception as e:
                 print(f"Could not load DLC confidences/poops: {e}")
                 dlc_confs = None
@@ -204,6 +226,25 @@ def create_hunting_video_clip(video_path, probs, preds, start_frame, end_frame, 
     orig_fps = cap.get(cv2.CAP_PROP_FPS)
     orig_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    
+    # Precompute global poop exclusion mask across the whole video if plot_poops is enabled
+    poop_mask_binary = None
+    poop_mask_bool = None
+    poop_contours = []
+    poop_color_bgr = (0, 75, 150)       # Brown in BGR
+    poop_border_color = (0, 110, 220)   # Amber / bright brown border for high visibility
+    
+    if plot_poops and all_poop_x:
+        poop_mask_binary = np.zeros((orig_h, orig_w), dtype=np.uint8)
+        mask_radius = max(1, int(round(poop_dist_thresh)))
+        for px, py in zip(all_poop_x, all_poop_y):
+            ix, iy = int(round(px)), int(round(py))
+            if 0 <= ix < orig_w and 0 <= iy < orig_h:
+                cv2.circle(poop_mask_binary, (ix, iy), mask_radius, 255, -1)
+        
+        poop_mask_bool = (poop_mask_binary > 0)
+        poop_contours, _ = cv2.findContours(poop_mask_binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        print(f"POOP FILTER VISUALIZER: Created poop exclusion mask with radius {mask_radius}px across {len(all_poop_x)} detections ({len(poop_contours)} mask clusters).")
     
     # Height Calculation
     # Original logic was 1/3. You requested a 20% decrease.
@@ -228,7 +269,8 @@ def create_hunting_video_clip(video_path, probs, preds, start_frame, end_frame, 
             curr_pred_cls = preds[data_idx]
             
             # 1. Generate Transparent Plot
-            plot_img_rgba = render_plot_frame_transparent(probs, data_idx, trailing_frames, plot_w, plot_h)
+            plot_img_rgba = render_plot_frame_transparent(probs, data_idx, trailing_frames, plot_w, plot_h,
+                                                           plot_poops=plot_poops, poop_dist_thresh=poop_dist_thresh)
             
             # 2. Overlay Plot on Frame (Top area)
             # Darken the background behind the plot slightly for readability
@@ -237,6 +279,14 @@ def create_hunting_video_clip(video_path, probs, preds, start_frame, end_frame, 
             cv2.addWeighted(overlay, 0.4, frame, 0.6, 0, frame) 
             
             frame = overlay_transparent(frame, plot_img_rgba, 0, 0)
+            
+            # 2.4 Draw Poop Filter Exclusion Mask if plot_poops is enabled
+            if plot_poops and poop_mask_bool is not None and np.any(poop_mask_bool):
+                # Vectorized semi-transparent tint for the poop mask regions (alpha ~ 0.35)
+                frame[poop_mask_bool] = ((frame[poop_mask_bool].astype(np.uint16) * 65 + 
+                                          np.array(poop_color_bgr, dtype=np.uint16) * 35) // 100).astype(np.uint8)
+                if poop_contours:
+                    cv2.drawContours(frame, poop_contours, -1, poop_border_color, 1, cv2.LINE_AA)
             
             # 2.5 Draw DLC data if provided
             if dlc_data is not None:
@@ -259,6 +309,12 @@ def create_hunting_video_clip(video_path, probs, preds, start_frame, end_frame, 
                             if p_idx == 4 and dlc_confs is not None and len(dlc_confs) > 5 and dlc_confs[5][data_idx]:
                                 draw_color = (255, 0, 255) # Magenta for blurry cricket
                                 text_suffix = " (blurry)"
+                            
+                            # Check if cricket coordinate falls inside a poop exclusion mask
+                            if p_idx == 4 and poop_mask_binary is not None:
+                                ix_c, iy_c = int(round(x)), int(round(y))
+                                if 0 <= ix_c < orig_w and 0 <= iy_c < orig_h and poop_mask_binary[iy_c, ix_c] > 0:
+                                    text_suffix += " [masked]"
                                 
                             cv2.circle(frame, (int(x), int(y)), circle_radius, draw_color, -1)
                             

@@ -17,8 +17,9 @@ import RatHunt_Inference
 class TimelineWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setMinimumHeight(150)
+        self.setMinimumHeight(160)
         self.labels = None
+        self.gt_labels = None
         self.probs = None
         self.total_frames = 1
         self.current_frame = 0
@@ -31,7 +32,7 @@ class TimelineWidget(QWidget):
         self.is_panning = False
         self.last_mouse_x = 0
         
-        # 0=Background, 1=Stalking, 2=Pursuit, 3=Eating
+        # 0=Background, 1=Cricket Present, 2=Pursuit, 3=Eating
         self.colors = {
             0: QColor(200, 200, 200), # Gray
             1: QColor(255, 165, 0),   # Orange
@@ -39,8 +40,9 @@ class TimelineWidget(QWidget):
             3: QColor(0, 255, 0)      # Green
         }
         
-    def set_data(self, labels, probs, current_frame):
+    def set_data(self, labels, probs, current_frame, gt_labels=None):
         self.labels = labels
+        self.gt_labels = gt_labels
         self.probs = probs
         self.total_frames = len(labels) if labels is not None and len(labels) > 0 else 1
         self.current_frame = current_frame
@@ -78,6 +80,36 @@ class TimelineWidget(QWidget):
         mid = self.rect().width() / 2
         if x > mid or x < 0:
             self.center_on_frame(frame)
+
+    def _draw_bar(self, painter, label_array, w, y_pos, bar_h):
+        if label_array is None or len(label_array) == 0:
+            return
+        changes = np.where(label_array[:-1] != label_array[1:])[0] + 1
+        starts = np.concatenate(([0], changes))
+        ends = np.concatenate((changes, [len(label_array)]))
+        
+        rect_w = self.rect().width()
+        for s, e in zip(starts, ends):
+            val = label_array[s]
+            x1 = int((s / self.total_frames) * w + self.offset_x)
+            x2 = int((e / self.total_frames) * w + self.offset_x)
+            
+            if x2 > 0 and x1 < rect_w:
+                painter.fillRect(x1, y_pos, max(1, x2 - x1), bar_h, self.colors.get(val, QColor(0, 0, 0)))
+
+    def _draw_badge(self, painter, text, y_pos, h_pos):
+        badge_w = 90
+        badge_h = min(20, max(14, h_pos - 6))
+        badge_y = y_pos + (h_pos - badge_h) // 2
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(15, 15, 15, 190))
+        painter.drawRoundedRect(8, badge_y, badge_w, badge_h, 4, 4)
+        painter.setPen(QColor(255, 255, 255))
+        font = painter.font()
+        font.setPointSize(8)
+        font.setBold(True)
+        painter.setFont(font)
+        painter.drawText(8, badge_y, badge_w, badge_h, Qt.AlignCenter, text)
         
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -89,44 +121,51 @@ class TimelineWidget(QWidget):
         w = rect.width() * self.zoom
         h = rect.height()
         
-        # Split into upper half (probs) and lower half (labels)
-        prob_h = int(h * 0.6)
-        lbl_h = h - prob_h
+        # Determine track layout
+        has_gt = (self.gt_labels is not None)
+        if has_gt:
+            prob_h = int(h * 0.48)
+            pred_h = int((h - prob_h) * 0.50)
+            gt_h = h - prob_h - pred_h
+            pred_y = prob_h
+            gt_y = prob_h + pred_h
+        else:
+            prob_h = int(h * 0.65)
+            pred_h = h - prob_h
+            pred_y = prob_h
+            gt_h = 0
+            gt_y = None
         
-        # Draw labels
-        if len(self.labels) > 0:
-            changes = np.where(self.labels[:-1] != self.labels[1:])[0] + 1
-            starts = np.concatenate(([0], changes))
-            ends = np.concatenate((changes, [len(self.labels)]))
+        # 1. Draw Predicted Bar
+        self._draw_bar(painter, self.labels, w, pred_y, pred_h)
+        
+        # 2. Draw Manual Ground Truth Bar (if comparison active)
+        if has_gt:
+            self._draw_bar(painter, self.gt_labels, w, gt_y, gt_h)
+            # Separator line between Predicted and Manual
+            painter.setPen(QPen(QColor(80, 80, 80, 180), 1))
+            painter.drawLine(0, gt_y, rect.width(), gt_y)
             
-            for s, e in zip(starts, ends):
-                val = self.labels[s]
-                x1 = int((s / self.total_frames) * w + self.offset_x)
-                x2 = int((e / self.total_frames) * w + self.offset_x)
-                
-                # Only draw if visible
-                if x2 > 0 and x1 < rect.width():
-                    painter.fillRect(x1, prob_h, x2 - x1, lbl_h, self.colors.get(val, QColor(0,0,0)))
+        # Draw Badges for clarity
+        self._draw_badge(painter, "PREDICTED", pred_y, pred_h)
+        if has_gt:
+            self._draw_badge(painter, "MANUAL (GT)", gt_y, gt_h)
         
-        # Draw probs
+        # 3. Draw Probabilities (upper section)
         if self.probs is not None and len(self.probs) == self.total_frames:
-            # Downsample drawing if heavily zoomed out to save CPU
             step = max(1, int(self.total_frames / w))
-            
             for c in range(4):
-                painter.setPen(QPen(self.colors[c], 3))
+                painter.setPen(QPen(self.colors[c], 2.5))
                 pts = []
                 for f in range(0, self.total_frames, step):
                     x = int((f / self.total_frames) * w + self.offset_x)
                     if 0 <= x <= rect.width() + 10:
-                        y = prob_h - int(self.probs[f, c] * prob_h)
+                        y = prob_h - int(self.probs[f, c] * (prob_h - 4))
                         pts.append((x, y))
-                
-                # Draw lines between pts
-                for i in range(len(pts)-1):
+                for i in range(len(pts) - 1):
                     painter.drawLine(pts[i][0], pts[i][1], pts[i+1][0], pts[i+1][1])
                     
-        # Draw Selection
+        # 4. Draw Selection
         if self.selection_start != -1 and self.selection_end != -1:
             s = min(self.selection_start, self.selection_end)
             e = max(self.selection_start, self.selection_end)
@@ -134,7 +173,7 @@ class TimelineWidget(QWidget):
             x2 = int((e / self.total_frames) * w + self.offset_x)
             painter.fillRect(x1, 0, x2 - x1, h, QColor(0, 0, 255, 80)) 
             
-        # Draw Playhead
+        # 5. Draw Playhead
         x = int(self.get_x_for_frame(self.current_frame))
         painter.setPen(QPen(QColor(0, 0, 0), 2))
         painter.drawLine(x, 0, x, h)
@@ -200,6 +239,8 @@ class ReviewGUI(QMainWindow):
         self.video_fps = 30
         
         self.labels = None
+        self.gt_labels = None
+        self.gt_folder = None
         self.probs = None
         self.dlc_data = None
         self.dlc_confs = None
@@ -214,6 +255,9 @@ class ReviewGUI(QMainWindow):
         self.init_ui()
         QApplication.instance().installEventFilter(self)
         
+        if '--compare' in sys.argv:
+            QTimer.singleShot(200, self.prompt_gt_folder)
+        
     def init_ui(self):
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
@@ -223,8 +267,11 @@ class ReviewGUI(QMainWindow):
         top_layout = QHBoxLayout()
         self.btn_load_vid = QPushButton("Load Video")
         self.btn_load_vid.clicked.connect(self.load_video)
-        # Prevent buttons from stealing focus from shortcuts
         self.btn_load_vid.setFocusPolicy(Qt.NoFocus)
+        
+        self.btn_compare_mode = QPushButton("Comparison Mode: OFF")
+        self.btn_compare_mode.clicked.connect(self.toggle_compare_mode)
+        self.btn_compare_mode.setFocusPolicy(Qt.NoFocus)
         
         self.btn_load_label = QPushButton("Load Label Override")
         self.btn_load_label.clicked.connect(self.load_label)
@@ -233,6 +280,7 @@ class ReviewGUI(QMainWindow):
         self.lbl_info = QLabel("No video loaded.")
         
         top_layout.addWidget(self.btn_load_vid)
+        top_layout.addWidget(self.btn_compare_mode)
         top_layout.addWidget(self.btn_load_label)
         top_layout.addWidget(self.lbl_info)
         top_layout.addStretch()
@@ -278,8 +326,8 @@ class ReviewGUI(QMainWindow):
         layout.addWidget(self.timeline)
         
         # Instructions
-        inst = QLabel("<b>Controls:</b> Space=Play/Pause, Left/Right Arrow=Skip by seconds (Hold to repeat). <br><b>Timeline:</b> Scroll wheel to zoom, Middle/Right-click drag to pan. <br><b>Live Editing:</b> Tap <b>0</b>=Bg, <b>1</b>=Stalk, <b>2</b>=Pursuit, <b>3</b>=Eat to toggle continuous painting. Tap again to revert to No Change.")
-        inst.setStyleSheet("font-size: 14px;")
+        inst = QLabel("<b>Controls:</b> Space=Play/Pause, Left/Right Arrow=Skip by seconds (Hold to repeat). <br><b>Timeline:</b> Scroll wheel to zoom, Middle/Right-click drag to pan. <br><b>Live Editing:</b> Tap <b>0</b>=Bg, <b>1</b>=Cricket Present, <b>2</b>=Pursuit, <b>3</b>=Eat to toggle continuous painting. Tap again to revert to No Change.")
+        inst.setStyleSheet("font-size: 13px;")
         layout.addWidget(inst)
         
     def eventFilter(self, obj, event):
@@ -400,65 +448,263 @@ class ReviewGUI(QMainWindow):
         if prob_paths:
             try:
                 prob_df = pd.read_csv(prob_paths[0])
-                self.probs = prob_df[['Background', 'Stalking', 'Pursuit', 'Eating']].values
+                stalk_col = 'Cricket Present' if 'Cricket Present' in prob_df.columns else ('Stalking' if 'Stalking' in prob_df.columns else prob_df.columns[1])
+                eat_col = 'Eating' if 'Eating' in prob_df.columns else prob_df.columns[3]
+                self.probs = prob_df[['Background', stalk_col, 'Pursuit', eat_col]].values
                 print(f"Loaded probabilities from {os.path.basename(prob_paths[0])}")
             except Exception as e:
                 print(f"Failed to load probs: {e}")
             
-        # Find Labels
-        label_paths = glob.glob(os.path.join(folder, f"{clean_base}_analyzed.xlsx"))
-        if not label_paths:
-            label_paths = glob.glob(os.path.join(folder, "excel_files", f"{clean_base}_analyzed.xlsx"))
+        # Find Labels (.xlsx or .csv)
+        label_patterns = [
+            os.path.join(folder, f"{clean_base}_refined.xlsx"),
+            os.path.join(folder, f"{clean_base}_refined.csv"),
+            os.path.join(folder, f"{clean_base}_analyzed.xlsx"),
+            os.path.join(folder, f"{clean_base}_analyzed.csv"),
+            os.path.join(folder, "excel_files", f"{clean_base}_analyzed.xlsx"),
+            os.path.join(folder, "excel_files", f"{clean_base}_analyzed.csv"),
+        ]
+        found_label = None
+        for lp in label_patterns:
+            matches = glob.glob(lp)
+            if matches:
+                found_label = matches[0]
+                break
             
-        if label_paths:
-            self.load_label_file(label_paths[0])
+        if found_label:
+            self.load_label_file(found_label)
         else:
             self.labels = np.zeros(self.total_frames, dtype=int)
             self.timeline.set_data(self.labels, self.probs, 0)
             self.lbl_info.setText(f"Loaded {base} (No labels found)")
             
+        if self.gt_folder:
+            self.match_and_load_gt()
+            
         self.set_frame(0)
+        
+    def prompt_gt_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "Select Folder with Manual Labels (.csv / .xlsx)")
+        if folder:
+            self.set_gt_folder(folder)
+            
+    def set_gt_folder(self, folder):
+        self.gt_folder = folder
+        folder_name = os.path.basename(folder)
+        self.btn_compare_mode.setText(f"GT: {folder_name}")
+        self.btn_compare_mode.setStyleSheet("background-color: #1976D2; color: white; font-weight: bold; padding: 4px 8px;")
+        if self.video_path:
+            self.match_and_load_gt()
+        else:
+            QMessageBox.information(self, "Comparison Mode", f"Manual labels folder set to:\n{folder}\n\nClick 'Load Video' to begin comparison review.")
+            
+    def toggle_compare_mode(self):
+        if self.gt_folder is None:
+            self.prompt_gt_folder()
+        else:
+            reply = QMessageBox.question(
+                self, 
+                "Comparison Mode", 
+                f"Current GT Folder:\n{self.gt_folder}\n\nDo you want to change folder (Yes), disable comparison (No), or cancel?",
+                QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel
+            )
+            if reply == QMessageBox.Yes:
+                self.prompt_gt_folder()
+            elif reply == QMessageBox.No:
+                self.gt_folder = None
+                self.gt_labels = None
+                self.btn_compare_mode.setText("Comparison Mode: OFF")
+                self.btn_compare_mode.setStyleSheet("")
+                if self.labels is not None:
+                    self.timeline.set_data(self.labels, self.probs, self.current_frame, gt_labels=None)
+                if not self.is_playing:
+                    self.set_frame(self.current_frame)
+                    
+    def match_and_load_gt(self):
+        if not self.gt_folder or not self.video_path or self.total_frames <= 0:
+            self.gt_labels = None
+            if self.labels is not None:
+                self.timeline.set_data(self.labels, self.probs, self.current_frame, gt_labels=None)
+            return
+
+        base = os.path.basename(self.video_path)
+        clean_base = re.sub(r'DLC_resnet50.*\.csv$', '', base, flags=re.IGNORECASE)
+        if clean_base == base:
+            clean_base = base[:base.rfind('.')] if '.' in base else base
+
+        hunts = []
+        matched_source = ""
+
+        # 1. Dan Format matching: Animal_D(day)_HS(session)
+        match_dan = re.search(r'([a-zA-Z]+\d+)_D(\d+)_HS(\d+)', clean_base, re.IGNORECASE)
+        if match_dan:
+            animal = match_dan.group(1).upper()
+            session = int(match_dan.group(3))
+            
+            # Look for file with animal in name first (e.g. CricketHuntTimes_XP03.csv)
+            cand_files = glob.glob(os.path.join(self.gt_folder, f"*{animal}*.csv")) + \
+                         glob.glob(os.path.join(self.gt_folder, f"*{animal}*.xlsx"))
+            if not cand_files:
+                cand_files = glob.glob(os.path.join(self.gt_folder, "*.csv")) + \
+                             glob.glob(os.path.join(self.gt_folder, "*.xlsx"))
+                             
+            for cf in cand_files:
+                dan_dict = dataset_utils.parse_dan_label_file(cf)
+                if (animal, session) in dan_dict:
+                    hunts = dan_dict[(animal, session)]
+                    matched_source = f"{os.path.basename(cf)} ({animal} S{session})"
+                    break
+                    
+        # 2. Lucas Format matching: (LW\d+)[-_]hunt[-_]?(\d+)
+        if not hunts:
+            match_lucas = re.search(r'(LW\d+)[-_]hunt[-_]?(\d+)', clean_base, re.IGNORECASE)
+            if match_lucas:
+                animal = match_lucas.group(1).lower()
+                hunt_num = match_lucas.group(2)
+                
+                cand_direct = os.path.join(self.gt_folder, f"{clean_base}_analyzed.xlsx")
+                cand_direct_csv = os.path.join(self.gt_folder, f"{clean_base}_analyzed.csv")
+                if os.path.exists(cand_direct):
+                    hunts = dataset_utils.parse_lucas_labels(cand_direct)
+                    matched_source = os.path.basename(cand_direct)
+                elif os.path.exists(cand_direct_csv):
+                    hunts = dataset_utils.parse_lucas_labels(cand_direct_csv)
+                    matched_source = os.path.basename(cand_direct_csv)
+                else:
+                    all_files = glob.glob(os.path.join(self.gt_folder, "*.xlsx")) + glob.glob(os.path.join(self.gt_folder, "*.csv"))
+                    for pf in all_files:
+                        pf_lower = os.path.basename(pf).lower().replace('_', '-')
+                        if animal in pf_lower and (f"hunt-{hunt_num}" in pf_lower or f"hunt{hunt_num}" in pf_lower):
+                            hunts = dataset_utils.parse_lucas_labels(pf)
+                            matched_source = os.path.basename(pf)
+                            break
+
+        # 3. Direct base file match fallback
+        if not hunts:
+            direct_cand = glob.glob(os.path.join(self.gt_folder, f"{clean_base}*.csv")) + \
+                          glob.glob(os.path.join(self.gt_folder, f"{clean_base}*.xlsx"))
+            for dc in direct_cand:
+                try_hunts = dataset_utils.parse_lucas_labels(dc)
+                if try_hunts:
+                    hunts = try_hunts
+                    matched_source = os.path.basename(dc)
+                    break
+
+        if hunts:
+            self.gt_labels = dataset_utils.hunts_to_sequence(hunts, self.total_frames)
+            self.timeline.set_data(self.labels, self.probs, self.current_frame, gt_labels=self.gt_labels)
+            print(f"Comparison Mode: Matched manual labels from {matched_source} ({len(hunts)} hunts)")
+            curr_text = self.lbl_info.text()
+            self.lbl_info.setText(f"{curr_text} | GT: {matched_source} ({len(hunts)} hunts)")
+        else:
+            self.gt_labels = None
+            self.timeline.set_data(self.labels, self.probs, self.current_frame, gt_labels=None)
+            print(f"Comparison Mode: No matching manual label found for {clean_base} in {self.gt_folder}")
+            curr_text = self.lbl_info.text()
+            self.lbl_info.setText(f"{curr_text} | GT: No match found")
         
     def load_label(self):
         if not self.cap: return
-        path, _ = QFileDialog.getOpenFileName(self, "Open Label File", "", "Excel Files (*.xlsx)")
+        path, _ = QFileDialog.getOpenFileName(
+            self, 
+            "Open Label File", 
+            "", 
+            "Label Files (*.xlsx *.csv);;Excel Files (*.xlsx);;CSV Files (*.csv);;All Files (*)"
+        )
         if path:
             self.load_label_file(path)
             
     def load_label_file(self, path):
         self.label_path = path
         try:
-            df = pd.read_excel(path)
-            events = df.to_dict('records')
+            seq = None
+            loaded_msg = ""
             
-            mapped_events = []
-            for ev in events:
-                mapped_events.append({
-                    'enter': ev.get('Enter_Frame', -1),
-                    'pursuit': ev.get('Enter_Frame', -1) + ev.get('Latency_to_Attack_Frames', 0) if ev.get('Latency_to_Attack_Frames', 0) > 0 else -1,
-                    'capture': ev.get('Capture_Frame', -1),
-                    'capture_end': ev.get('Consumption_End_Frame', ev.get('Capture_Frame', 0) + dataset_utils.EATING_BUFFER)
-                })
+            # 1. Dan Format: Use shared dataset_utils.parse_dan_label_file
+            dan_dict = dataset_utils.parse_dan_label_file(path)
+            if dan_dict:
+                hunts = []
+                if self.video_path:
+                    base = os.path.basename(self.video_path)
+                    match = re.search(r'([a-zA-Z]+\d+)_D(\d+)_HS(\d+)', base, re.IGNORECASE)
+                    if match:
+                        v_animal = match.group(1).upper()
+                        v_session = int(match.group(3))
+                        hunts = dan_dict.get((v_animal, v_session), [])
+                        if not hunts:
+                            for (a, s), h_list in dan_dict.items():
+                                if s == v_session:
+                                    hunts = h_list
+                                    break
+                    else:
+                        match_s = re.search(r'HS(\d+)', base, re.IGNORECASE)
+                        if match_s:
+                            v_session = int(match_s.group(1))
+                            for (a, s), h_list in dan_dict.items():
+                                if s == v_session:
+                                    hunts = h_list
+                                    break
+                
+                if not hunts and len(dan_dict) == 1:
+                    hunts = next(iter(dan_dict.values()))
+                    
+                if hunts:
+                    seq = dataset_utils.hunts_to_sequence(hunts, self.total_frames)
+                    loaded_msg = f"Loaded Dan Labels: {os.path.basename(path)} ({len(hunts)} hunts)"
+                else:
+                    avail = list(dan_dict.keys())
+                    print(f"Warning: Could not match video session in Dan file {path}. Available sessions: {avail}")
             
-            seq = np.zeros(self.total_frames, dtype=int)
-            for event in mapped_events:
-                enter = int(event['enter'])
-                pursuit = int(event['pursuit'])
-                capture = int(event['capture'])
-                capture_end = int(event['capture_end'])
-                
-                enter = max(0, min(self.total_frames, enter))
-                pursuit = max(0, min(self.total_frames, pursuit))
-                capture = max(0, min(self.total_frames, capture))
-                eating_end = min(self.total_frames, capture_end)
-                
-                if pursuit > enter: seq[enter:pursuit] = 1 
-                if capture > pursuit: seq[pursuit:capture] = 2 
-                if eating_end > capture: seq[capture:eating_end] = 3 
-                
-            self.labels = seq
-            self.timeline.set_data(self.labels, self.probs, self.current_frame)
-            self.lbl_info.setText(f"Loaded: {os.path.basename(path)}")
+            # 2. Lucas / Analyzed Format: Use shared dataset_utils.parse_lucas_labels
+            if seq is None:
+                lucas_hunts = dataset_utils.parse_lucas_labels(path)
+                if lucas_hunts:
+                    seq = dataset_utils.hunts_to_sequence(lucas_hunts, self.total_frames)
+                    loaded_msg = f"Loaded Analyzed Labels: {os.path.basename(path)} ({len(lucas_hunts)} hunts)"
+                    
+            # 3. Raw Lucas Format (Event and Frame columns)
+            if seq is None:
+                df = pd.read_csv(path) if path.endswith('.csv') else pd.read_excel(path)
+                df.columns = df.columns.astype(str).str.strip()
+                if 'Event' in df.columns and 'Frame' in df.columns:
+                    current_hunt = {}
+                    raw_hunts = []
+                    for _, row in df.iterrows():
+                        ev_type = str(row['Event']).lower().strip() if pd.notna(row.get('Event')) else ""
+                        if pd.isna(row.get('Frame')): continue
+                        f_val = int(row['Frame'])
+                        if 'enter' in ev_type:
+                            if current_hunt and current_hunt.get('enter') is not None and current_hunt.get('capture') is not None:
+                                raw_hunts.append(current_hunt)
+                            current_hunt = {'enter': f_val, 'pursuit_start': f_val, 'capture': None, 'consumption_end': None}
+                        elif 'pursuit' in ev_type:
+                            if current_hunt: current_hunt['pursuit_start'] = f_val
+                        elif 'capture' in ev_type:
+                            if current_hunt: current_hunt['capture'] = f_val
+                    if current_hunt and current_hunt.get('enter') is not None and current_hunt.get('capture') is not None:
+                        raw_hunts.append(current_hunt)
+                    if raw_hunts:
+                        seq = dataset_utils.hunts_to_sequence(raw_hunts, self.total_frames)
+                        loaded_msg = f"Loaded Raw Lucas Labels: {os.path.basename(path)} ({len(raw_hunts)} hunts)"
+
+            # 4. Frame-by-frame direct predictions/labels
+            if seq is None:
+                df = pd.read_csv(path) if path.endswith('.csv') else pd.read_excel(path)
+                df.columns = df.columns.astype(str).str.strip()
+                if any(c.lower() in ['label', 'labels', 'prediction', 'pred', 'class'] for c in df.columns):
+                    lbl_col = next(c for c in df.columns if c.lower() in ['label', 'labels', 'prediction', 'pred', 'class'])
+                    vals = df[lbl_col].dropna().values.astype(int)
+                    seq = np.zeros(self.total_frames, dtype=int)
+                    n = min(len(vals), self.total_frames)
+                    seq[:n] = vals[:n]
+                    loaded_msg = f"Loaded Frame Labels: {os.path.basename(path)}"
+
+            if seq is not None:
+                self.labels = seq
+                self.timeline.set_data(self.labels, self.probs, self.current_frame)
+                self.lbl_info.setText(loaded_msg if loaded_msg else f"Loaded: {os.path.basename(path)}")
+            else:
+                QMessageBox.warning(self, "Warning", f"Could not parse hunts from {os.path.basename(path)}.\nPlease check file columns.")
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Could not load label file:\n{e}")
             
@@ -509,15 +755,29 @@ class ReviewGUI(QMainWindow):
                                     cv2.putText(img, f"{conf:.2f}", (int(x)+5, int(y)-5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, colors[p_idx], 1)
             
             if self.labels is not None:
-                lbl_val = self.labels[self.current_frame]
-                cls_names = {0: 'Background', 1: 'Stalking', 2: 'Pursuit', 3: 'Eating'}
-                colors_bgr = {0: (200,200,200), 1: (0,165,255), 2: (0,0,255), 3: (0,255,0)}
-                cv2.putText(img, f"Class: {cls_names.get(lbl_val, 'Unknown')}", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.2, colors_bgr.get(lbl_val, (255,255,255)), 3)
+                cls_names = {0: 'Background', 1: 'Cricket Present', 2: 'Pursuit', 3: 'Eating'}
+                colors_bgr = {0: (200, 200, 200), 1: (0, 165, 255), 2: (0, 0, 255), 3: (0, 255, 0)}
                 
-                # Draw Brush state
-                brush_names = {None: 'No Change', 0: 'Background', 1: 'Stalking', 2: 'Pursuit', 3: 'Eating'}
-                brush_colors = {None: (255, 255, 0), 0: (200,200,200), 1: (0,165,255), 2: (0,0,255), 3: (0,255,0)}
-                cv2.putText(img, f"Brush: {brush_names.get(self.active_paint_label, 'No Change')}", (50, 90), cv2.FONT_HERSHEY_SIMPLEX, 1.2, brush_colors.get(self.active_paint_label, (255,255,0)), 3)
+                y_pos = 26
+                lbl_val = self.labels[self.current_frame]
+                text_pred = f"Pred: {cls_names.get(lbl_val, 'Unknown')}"
+                # Crisp outline + text for high contrast on any background
+                cv2.putText(img, text_pred, (18, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3, cv2.LINE_AA)
+                cv2.putText(img, text_pred, (18, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.6, colors_bgr.get(lbl_val, (255, 255, 255)), 1, cv2.LINE_AA)
+                
+                if self.gt_labels is not None and self.current_frame < len(self.gt_labels):
+                    y_pos += 22
+                    gt_val = self.gt_labels[self.current_frame]
+                    text_gt = f"Manual: {cls_names.get(gt_val, 'Unknown')}"
+                    cv2.putText(img, text_gt, (18, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3, cv2.LINE_AA)
+                    cv2.putText(img, text_gt, (18, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.6, colors_bgr.get(gt_val, (255, 255, 255)), 1, cv2.LINE_AA)
+                
+                y_pos += 22
+                brush_names = {None: 'No Change', 0: 'Background', 1: 'Cricket Present', 2: 'Pursuit', 3: 'Eating'}
+                brush_colors = {None: (255, 255, 0), 0: (200, 200, 200), 1: (0, 165, 255), 2: (0, 0, 255), 3: (0, 255, 0)}
+                text_brush = f"Brush: {brush_names.get(self.active_paint_label, 'No Change')}"
+                cv2.putText(img, text_brush, (18, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3, cv2.LINE_AA)
+                cv2.putText(img, text_brush, (18, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.6, brush_colors.get(self.active_paint_label, (255, 255, 0)), 1, cv2.LINE_AA)
             
             img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             h, w, ch = img_rgb.shape
@@ -579,12 +839,20 @@ class ReviewGUI(QMainWindow):
                     
                 if val == 0:
                     current_event['capture_end'] = s
+                    if current_event['pursuit'] == -1:
+                        current_event['pursuit'] = current_event['enter']
+                    if current_event['capture'] == -1:
+                        current_event['capture'] = current_event['capture_end']
                     events.append(current_event)
                     in_hunt = False
                     current_event = None
                     
         if in_hunt and current_event:
             current_event['capture_end'] = len(lbls)
+            if current_event['pursuit'] == -1:
+                current_event['pursuit'] = current_event['enter']
+            if current_event['capture'] == -1:
+                current_event['capture'] = current_event['capture_end']
             events.append(current_event)
             
         return events
@@ -600,7 +868,12 @@ class ReviewGUI(QMainWindow):
         out_name = f"{clean_base}_refined.xlsx"
         default_path = os.path.join(os.path.dirname(self.video_path), out_name)
         
-        path, _ = QFileDialog.getSaveFileName(self, "Save Refined Labels", default_path, "Excel Files (*.xlsx)")
+        path, _ = QFileDialog.getSaveFileName(
+            self, 
+            "Save Refined Labels", 
+            default_path, 
+            "Excel Files (*.xlsx);;CSV Files (*.csv);;All Files (*)"
+        )
         if path:
             try:
                 RatHunt_Inference.generate_analyzed_excel(events, path, self.video_fps)
