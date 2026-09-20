@@ -9,6 +9,8 @@ trigger: always_on
 - Avoid interactive shells completely. Example: Use `cmd /c pip list`, not `pip list`.
 
 ## Python Environment
-- The active virtual environment is located in the `.venv` subdirectory.
-- Always default to using this project's local Python via '.venv\Scripts\python.exe'
-- When executing a script or inspecting data (like reading a CSV), always use `cmd /c .venv\Scripts\python.exe <script_name>`. Do not rely on the global system Python.
+- The active virtual environment is located in the original LSTM project directory:
+  `C:\Users\bcary\Documents\Work\CODE\CricketCode\LSTM_hunt_label\.venv` (or relative `..\LSTM_hunt_label\.venv`).
+- Always default to using Python via `..\LSTM_hunt_label\.venv\Scripts\python.exe` (or `C:\Users\bcary\Documents\Work\CODE\CricketCode\LSTM_hunt_label\.venv\Scripts\python.exe`).
+- When executing a script or inspecting data, use:
+  `cmd /c ..\LSTM_hunt_label\.venv\Scripts\python.exe <script_name>`. Do not rely on the global system Python.

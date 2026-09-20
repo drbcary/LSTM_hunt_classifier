@@ -11,7 +11,7 @@ warnings.filterwarnings('ignore')
 try:
     import PySide6.QtWidgets, PySide6.QtGui
     if not hasattr(PySide6.QtGui, 'QApplication'):
-        PySide6.QtGui.QApplication = PySide6.QtWidgets.QApplication
+        setattr(PySide6.QtGui, 'QApplication', PySide6.QtWidgets.QApplication)
 except ImportError:
     pass
 
@@ -189,18 +189,34 @@ def refine_predictions(probs, preds, cricket_visible_feature=None, transition_we
 # 5. Visualization Helpers
 # ==========================================
 
+def _safe_rat_frame_int(val):
+    if val is None:
+        return None
+    try:
+        f = float(val)
+        if f != f:  # NaN check
+            return None
+        return int(f)
+    except (ValueError, TypeError):
+        return None
+
 def events_to_sequence(events, num_frames):
     seq = np.zeros(num_frames, dtype=int)
     for event in events:
-        enter = int(event['enter'])
-        pursuit = int(event['pursuit']) if event.get('pursuit', -1) != -1 else enter
-        capture = int(event['capture'])
-        capture_end = event.get('capture_end', capture + dataset_utils.EATING_BUFFER)
+        raw_enter = _safe_rat_frame_int(event.get('enter', 0))
+        if raw_enter is None:
+            continue
+        enter = max(0, min(num_frames, raw_enter))
         
-        enter = max(0, min(num_frames, enter))
-        pursuit = max(enter, min(num_frames, pursuit))
-        capture = max(pursuit, min(num_frames, capture))
-        eating_end = max(capture, min(num_frames, int(capture_end)))
+        raw_pursuit = _safe_rat_frame_int(event.get('pursuit'))
+        pursuit = max(enter, min(num_frames, raw_pursuit if raw_pursuit is not None else enter))
+        
+        raw_cap = _safe_rat_frame_int(event.get('capture'))
+        capture = max(pursuit, min(num_frames, raw_cap if raw_cap is not None else pursuit))
+        
+        raw_end = _safe_rat_frame_int(event.get('capture_end'))
+        default_end = capture + getattr(dataset_utils, 'EATING_BUFFER', 300)
+        eating_end = max(capture, min(num_frames, raw_end if raw_end is not None else default_end))
         
         if pursuit > enter: seq[enter:pursuit] = 1 
         if capture > pursuit: seq[pursuit:capture] = 2 
@@ -208,9 +224,22 @@ def events_to_sequence(events, num_frames):
             
     return seq
 
+def load_ground_truth_sequence(label_path, dlc_path=None, num_frames=None, fps=30.0, label_format='lucas'):
+    """Loads ground truth sequence for rat hunting datasets."""
+    import MouseHunt_Inference
+    return MouseHunt_Inference.load_ground_truth_sequence(
+        label_path=label_path,
+        dlc_path=dlc_path,
+        num_frames=num_frames,
+        fps=fps,
+        label_format=label_format,
+        paradigm="rat"
+    )
+
 def plot_inference_results(probs, preds, refined_events=None, label_path=None, save_path=None, title="Inference Results", label_format='lucas', dlc_path=None):
     num_frames = len(preds)
     frames = np.arange(num_frames)
+    window_probs = []
     
     # Auto-detect if probs contains multi-window data
     if isinstance(probs, dict) and 'windows' in probs:
@@ -280,10 +309,14 @@ def plot_inference_results(probs, preds, refined_events=None, label_path=None, s
             true_seq = np.zeros(num_frames)
             
             for row in valid_hunts:
-                enter = row['enter']
-                capture = row['capture']
-                pursuit_start = row['pursuit_start']
-                cons_end = row['consumption_end']
+                enter = row.get('enter')
+                capture = row.get('capture')
+                if enter is None or capture is None:
+                    continue
+                pursuit_start = row.get('pursuit_start')
+                if pursuit_start is None:
+                    pursuit_start = enter
+                cons_end = row.get('consumption_end')
                 
                 eating_end = cons_end if cons_end is not None else capture + dataset_utils.EATING_BUFFER
                 
@@ -506,7 +539,7 @@ def run_inference_on_video(dlc_path, model, device, use_sliding_window=True, win
     
     # 1. Process Data
     video_width, _, video_fps = dataset_utils.get_video_params(dlc_path)
-    processed_data = dataset_utils.load_and_process_dlc(dlc_path, video_fps, filter_poops=True, poop_dist_thresh=6, poop_thresh=0.8)
+    processed_data = dataset_utils.load_and_process_dlc(dlc_path, video_fps, filter_poops=True, poop_dist_thresh=6, poop_thresh=0.9)
     if processed_data is None:
         return None, None
         
@@ -538,7 +571,7 @@ def run_inference_on_video(dlc_path, model, device, use_sliding_window=True, win
                 logits = model(chunk, lengths)
                 probs = torch.softmax(logits, dim=2)[0].cpu().numpy()
                 
-                if return_all_windows:
+                if return_all_windows and all_window_probs is not None:
                     all_window_probs.append({
                         'start': start,
                         'end': end,
@@ -767,7 +800,7 @@ def load_and_align_evaluation_data(folder_path, label_folder, label_format=None,
                     latency = int(row['Latency_to_Attack_Frames']) if 'Latency_to_Attack_Frames' in row and pd.notna(row['Latency_to_Attack_Frames']) else 0
                     pursuit = enter + latency
                     cons_end = row.get('Consumption_End_Frame')
-                    capture_end = int(cons_end) if pd.notna(cons_end) else capture + dataset_utils.EATING_BUFFER
+                    capture_end = int(cons_end) if (cons_end is not None and pd.notna(cons_end)) else capture + dataset_utils.EATING_BUFFER
                     pred_events.append({
                         'enter': enter,
                         'pursuit': pursuit,
@@ -839,11 +872,13 @@ def load_and_align_evaluation_data(folder_path, label_folder, label_format=None,
         # Build dense ground truth sequence
         y_true = np.zeros(num_frames, dtype=int)
         for row in true_hunts:
+            if row.get('enter') is None or row.get('capture') is None:
+                continue
             enter = int(row['enter'])
-            pursuit_start = int(row['pursuit_start'])
+            pursuit_start = int(row['pursuit_start']) if row.get('pursuit_start') is not None else enter
             capture = int(row['capture'])
             cons_end = row.get('consumption_end')
-            eating_end = int(cons_end) if cons_end is not None and pd.notna(cons_end) else capture + dataset_utils.EATING_BUFFER
+            eating_end = int(cons_end) if (cons_end is not None and pd.notna(cons_end)) else capture + dataset_utils.EATING_BUFFER
             enter = max(0, min(num_frames, enter))
             pursuit_start = max(0, min(num_frames, pursuit_start))
             capture = max(0, min(num_frames, capture))
@@ -1317,8 +1352,8 @@ def plot_master_evaluation_dashboard(all_true, all_raw, all_refined, all_probs, 
             p_curve, r_curve, _ = precision_recall_curve(bin_t, all_probs[:, c])
             ap = average_precision_score(bin_t, all_probs[:, c])
             axC.plot(r_curve, p_curve, color=colors[c], linewidth=2.0, label=f"{classes[c]} (AP={ap:.3f})")
-    axC.set_xlim([0.0, 1.0])
-    axC.set_ylim([0.0, 1.05])
+    axC.set_xlim((0.0, 1.0))
+    axC.set_ylim((0.0, 1.05))
     axC.set_xlabel('Recall', fontsize=10.5, fontweight='bold')
     axC.set_ylabel('Precision', fontsize=10.5, fontweight='bold')
     axC.set_title('C. Multiclass Precision-Recall Curves', fontsize=12, fontweight='bold', pad=8)
