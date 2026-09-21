@@ -190,6 +190,7 @@ class DLCAdapter:
         video_fps: Optional[float] = None,
         pred_thresh: Optional[float] = None,
         cricket_thresh: Optional[float] = None,
+        cricket_coord_thresh: Optional[float] = None,
         interp_limit: Optional[int] = None,
         include_blurry_cricket: Optional[bool] = None,
         include_cricket_immo: Optional[bool] = None,
@@ -205,6 +206,12 @@ class DLCAdapter:
         
         pred_th = pred_thresh if pred_thresh is not None else thresholds.predator_likelihood_thresh
         crick_th = cricket_thresh if cricket_thresh is not None else thresholds.cricket_likelihood_thresh
+        if cricket_coord_thresh is not None:
+            coord_th = cricket_coord_thresh
+        elif getattr(self.config, 'continuous_cricket_confidence', False):
+            coord_th = getattr(thresholds, 'cricket_coord_thresh', 0.30)
+        else:
+            coord_th = crick_th
         do_interp_limit = interp_limit if interp_limit is not None else sec_to_frames(thresholds.max_interp_gap_sec, fps)
         do_blurry = include_blurry_cricket if include_blurry_cricket is not None else getattr(schema, 'include_blurry_cricket', True)
         do_immo = include_cricket_immo if include_cricket_immo is not None else getattr(schema, 'include_cricket_immo', True)
@@ -390,16 +397,16 @@ class DLCAdapter:
             best_y = cand_ys[row_idx, best_idx]
             best_types = np.array(cand_names)[best_idx]
 
-            valid_mask = best_conf > crick_th
+            valid_mask = best_conf > coord_th
             final_cx = np.full(num_frames, np.nan)
             final_cy = np.full(num_frames, np.nan)
             final_cx[valid_mask] = best_x[valid_mask]
             final_cy[valid_mask] = best_y[valid_mask]
 
-            final_c_conf = best_conf
-            raw_final_c_conf = best_raw_conf
-            is_blurry = (best_types == 'blurry') & valid_mask
-            is_immo = (best_types == 'immo') & valid_mask
+            final_c_conf = np.where(valid_mask, best_conf, 0.0)
+            raw_final_c_conf = np.where(valid_mask, best_raw_conf, 0.0)
+            is_blurry = (best_types == 'blurry') & (best_conf > crick_th)
+            is_immo = (best_types == 'immo') & (best_conf > crick_th)
         else:
             final_cx = np.full(num_frames, np.nan)
             final_cy = np.full(num_frames, np.nan)
@@ -411,6 +418,7 @@ class DLCAdapter:
         if do_interp_limit > 0:
             final_cx = pd.Series(final_cx).interpolate(limit=do_interp_limit).values
             final_cy = pd.Series(final_cy).interpolate(limit=do_interp_limit).values
+            final_c_conf = pd.Series(final_c_conf).interpolate(limit=do_interp_limit).values
 
         # Filter fake/dead crickets using rolling window scaled by FPS if enabled
         if filter_dead_crickets:
@@ -433,6 +441,8 @@ class DLCAdapter:
                 if (e - s) >= dead_frame_thresh:
                     final_cx[s:e] = np.nan
                     final_cy[s:e] = np.nan
+                    final_c_conf[s:e] = 0.0
+                    raw_final_c_conf[s:e] = 0.0
 
         cricket_pos = np.column_stack((final_cx, final_cy))
 

@@ -75,9 +75,13 @@ class MouseInferencePipeline:
         model_weights_path: Optional[str] = None,
         config: Optional[MouseParadigmConfig] = None,
         device: Optional[torch.device] = None,
-        max_mem: Optional[float] = None
+        max_mem: Optional[float] = None,
+        continuous_cricket_confidence: Optional[bool] = None
     ):
         self.config = config or MouseParadigmConfig()
+        self.continuous_cricket_confidence = continuous_cricket_confidence
+        if continuous_cricket_confidence is not None:
+            self.config.continuous_cricket_confidence = continuous_cricket_confidence
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.max_mem = max_mem
         self.adapter = DLCAdapter(self.config)
@@ -90,6 +94,29 @@ class MouseInferencePipeline:
         self.model: Optional[HuntingBiLSTM] = None
         self.model_weights_path = model_weights_path
         self.target_fps: float = 30.0
+        if self.model_weights_path and os.path.exists(self.model_weights_path):
+            self._inspect_checkpoint()
+
+    def _inspect_checkpoint(self):
+        if not (self.model_weights_path and os.path.exists(self.model_weights_path)):
+            return
+        try:
+            ckpt = torch.load(self.model_weights_path, map_location='cpu')
+            if isinstance(ckpt, dict) and 'model_state_dict' in ckpt:
+                self.target_fps = float(ckpt.get('target_fps', self.target_fps))
+                if 'continuous_cricket_confidence' in ckpt:
+                    ckpt_cont = bool(ckpt['continuous_cricket_confidence'])
+                    if self.continuous_cricket_confidence is None:
+                        self.continuous_cricket_confidence = ckpt_cont
+                        self.config.continuous_cricket_confidence = ckpt_cont
+                        print(f"Auto-configured continuous_cricket_confidence={ckpt_cont} from model checkpoint.")
+                else:
+                    if self.continuous_cricket_confidence is None:
+                        self.continuous_cricket_confidence = False
+                        self.config.continuous_cricket_confidence = False
+            self.adapter = DLCAdapter(self.config)
+        except Exception:
+            pass
 
     def init_model(self, input_dim: int, hidden_dim: int = 256, num_layers: int = 3, num_classes: int = 5):
         if self.model_weights_path and os.path.exists(self.model_weights_path):
@@ -97,6 +124,18 @@ class MouseInferencePipeline:
             if isinstance(ckpt, dict) and 'model_state_dict' in ckpt:
                 self.target_fps = float(ckpt.get('target_fps', 30.0))
                 num_classes = int(ckpt.get('num_classes', num_classes))
+                hidden_dim = int(ckpt.get('hidden_dim', hidden_dim))
+                num_layers = int(ckpt.get('num_layers', num_layers))
+                if 'continuous_cricket_confidence' in ckpt:
+                    ckpt_cont = bool(ckpt['continuous_cricket_confidence'])
+                    if self.continuous_cricket_confidence is None:
+                        self.config.continuous_cricket_confidence = ckpt_cont
+                        self.continuous_cricket_confidence = ckpt_cont
+                        print(f"Auto-configured continuous_cricket_confidence={ckpt_cont} from model checkpoint.")
+                else:
+                    if self.continuous_cricket_confidence is None:
+                        self.continuous_cricket_confidence = False
+                        self.config.continuous_cricket_confidence = False
                 self.model = HuntingBiLSTM(
                     input_dim=input_dim,
                     hidden_dim=hidden_dim,
@@ -142,7 +181,9 @@ class MouseInferencePipeline:
         poop_thresh: Optional[float] = None,
         poop_dist_thresh: Optional[float] = None,
         cricket_thresh: Optional[float] = None,
+        cricket_coord_thresh: Optional[float] = None,
         pred_thresh: Optional[float] = None,
+        continuous_cricket_confidence: Optional[bool] = None,
         window_size: Optional[int] = None,
         step_size: Optional[int] = None,
         paradigm: str = "mouse",
@@ -152,6 +193,9 @@ class MouseInferencePipeline:
         Runs complete inference pipeline on a single session.
         Returns probabilities, frame predictions, extracted events, and metadata.
         """
+        if continuous_cricket_confidence is not None:
+            self.config.continuous_cricket_confidence = continuous_cricket_confidence
+
         # Configure GPU memory limit if requested
         effective_max_mem = max_mem if max_mem is not None else self.max_mem
         if effective_max_mem is not None and torch.cuda.is_available():
@@ -185,6 +229,7 @@ class MouseInferencePipeline:
             poop_thresh=poop_thresh,
             poop_dist_thresh=poop_dist_thresh,
             cricket_thresh=cricket_thresh,
+            cricket_coord_thresh=cricket_coord_thresh,
             pred_thresh=pred_thresh
         )
         if pose_data is None:
@@ -1901,7 +1946,8 @@ def batch_process_dlc_folder(
     poop_dist_thresh: float = 6.0,
     poop_thresh: float = 0.9,
     transition_weight: float = 5.0,
-    temperature: float = 1.0
+    temperature: float = 1.0,
+    continuous_cricket_confidence: Optional[bool] = None
 ):
     """
     Executes model batch inference across all DLC tracking files in folder_path.
@@ -1910,7 +1956,11 @@ def batch_process_dlc_folder(
         - Structured analyzed event Excel sheets into output_subdir
         - Diagnostic prediction timeline plots into plot_subdir
     """
-    pipeline = MouseInferencePipeline(model_weights_path=model_path, device=device)
+    pipeline = MouseInferencePipeline(
+        model_weights_path=model_path,
+        device=device,
+        continuous_cricket_confidence=continuous_cricket_confidence
+    )
     
     output_dir = os.path.join(folder_path, output_subdir) if output_subdir else folder_path
     plot_dir = os.path.join(folder_path, plot_subdir) if plot_subdir else folder_path
@@ -2210,7 +2260,8 @@ def batch_process_and_evaluate(
     transition_weight: float = 5.0,
     temperature: float = 1.0,
     timing_threshold_sec: float = 5.0,
-    duration_threshold_sec: float = 3.0
+    duration_threshold_sec: float = 3.0,
+    continuous_cricket_confidence: Optional[bool] = None
 ):
     """
     Batch processes a folder of mouse DLC tracking files and comprehensively evaluates performance
@@ -2255,7 +2306,8 @@ def batch_process_and_evaluate(
             poop_dist_thresh=poop_dist_thresh,
             poop_thresh=poop_thresh,
             transition_weight=transition_weight,
-            temperature=temperature
+            temperature=temperature,
+            continuous_cricket_confidence=continuous_cricket_confidence
         )
     else:
         print("\n[Info] Reusing existing inference outputs (rerun_inference=False).")
@@ -2480,9 +2532,9 @@ def batch_process_and_evaluate(
 
 if __name__ == "__main__":
     # Example usage analogous to RatHunt_Inference:
-    model_weights = r"C:\Users\bcary\Documents\Work\CODE\CricketCode\LSTM_hunt_label_mouse\models\mouse_models\HuntLSTM_mouse_feat45_dim256_lay3_ep188_valf1=0.8452.pth"
-    video_path = r"D:\Work\DATA\Diane\Exp30-32-DLCvids\20231025_DB_Exp30_day1-231025-091250_YFP-293-231025-095416_Cam1.avi"
-    dlc_file = r"D:\Work\DATA\Diane\Exp30-32-DLCvids\20231025_DB_Exp30_day1-231025-091250_YFP-293-231025-095416_Cam1DLC_resnet50_CrickHunt_tailApr26shuffle1_1000000.csv"
+    model_weights = r"C:\Users\bcary\Documents\Work\CODE\CricketCode\LSTM_hunt_label_mouse\models\mouse_models\HuntLSTM_mouse_feat45_dim256_lay3_ep157_valf1=0.8410.pth"
+    video_path = r"D:\Work\DATA\Diane\Exp30-32-DLCvids\20231025_DB_Exp30_day1-231025-091250_YFP-286-231025-091319_Cam1.avi"
+    dlc_file = r"D:\Work\DATA\Diane\Exp30-32-DLCvids\20231025_DB_Exp30_day1-231025-091250_YFP-286-231025-091319_Cam1DLC_resnet50_CrickHunt_tailApr26shuffle1_1000000.csv"
     label_file = r"D:\Work\DATA\Diane\Exp30-32-DLCvids\MasterBehExcels\Cricket_hunting_adults_20240923-Exp30and41.xlsx"
 
     output_dir = r"C:\Users\bcary\Documents\Work\CODE\CricketCode\LSTM_hunt_label_mouse\vids"
@@ -2499,9 +2551,11 @@ if __name__ == "__main__":
         label_format="diane_parts", # Auto-detects 'diane' or 'diane_parts'
         window_size=6000,
         step_size=1000,
-        filter_poops=True,   
+        transition_weight=100.0,
+        temperature=2,
         poop_thresh=0.92,
         poop_dist_thresh=6.0,
+        filter_poops=True,
         output_subdir="excel_files",
         plot_subdir="plots",
         prob_subdir="probs",
@@ -2518,8 +2572,11 @@ if __name__ == "__main__":
             label_path=label_file if os.path.exists(label_file) else None,
             refine_events=True,
             max_mem=0.8,
-            transition_weight=10.0,
-            temperature=1.5
+            transition_weight=100.0,
+            temperature=2,
+            poop_thresh=0.92,
+            poop_dist_thresh=6.0,
+            filter_poops=True,
         )
         probs = res['probabilities']
         preds = res['raw_predictions']
@@ -2540,8 +2597,8 @@ if __name__ == "__main__":
         plt.show()
 
         # 3. Render hunting video clip (optional)
-        start_frame = 6000
-        end_frame = 9000
+        start_frame = 99000
+        end_frame = 101500
         clip_name = f"{os.path.splitext(os.path.basename(video_path))[0]}_{start_frame}_{end_frame}_analyzed.mp4"
         output_path = os.path.join(output_dir, clip_name)
 
@@ -2558,7 +2615,7 @@ if __name__ == "__main__":
                 circle_radius=4,
                 include_blurry_cricket=True,
                 poop_dist_thresh=6,
-                filter_poops=True,
+                filter_poops=False,
                 plot_poops=True
             )
     else:

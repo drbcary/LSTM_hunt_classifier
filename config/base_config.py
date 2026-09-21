@@ -38,6 +38,7 @@ class ThresholdConfig:
     """Likelihood and filtering thresholds."""
     predator_likelihood_thresh: float = 0.9
     cricket_likelihood_thresh: float = 0.85
+    cricket_coord_thresh: float = 0.30     # Minimum noise-floor likelihood to retain cricket coordinates
     max_interp_gap_sec: float = 0.5        # Maximum interpolation gap in seconds (0.5s = 15 frames @ 30fps)
     cricket_movement_thresh: float = 0.3   # In arena-normalized or pixel units
     
@@ -62,3 +63,4 @@ class BaseParadigmConfig:
     thresholds: ThresholdConfig = field(default_factory=ThresholdConfig)
     max_bg_chunks_per_video: int = 5
     extract_video_fps: bool = True
+    continuous_cricket_confidence: bool = False   # True for continuous [0, 1] confidence; False for legacy cutoff boolean

@@ -151,7 +151,7 @@ def snap_chunk_to_transition(
 
     return start_idx, end_idx
 
-def create_dataset_sequences(paired_files, paradigm="rat", target_fps=30.0):
+def create_dataset_sequences(paired_files, paradigm="rat", target_fps=30.0, continuous_cricket_confidence=False):
     all_sequences = []
     all_targets = []
     total_hunts_processed = 0
@@ -161,7 +161,7 @@ def create_dataset_sequences(paired_files, paradigm="rat", target_fps=30.0):
     max_eating_frames = int(60 * target_fps)
     MAX_HUNT_SEQ_LEN = 5000
     
-    if VERBOSE: print(f"Processing {len(paired_files)} files (Balanced Mode, Paradigm: {paradigm}, Target FPS: {target_fps})...")
+    if VERBOSE: print(f"Processing {len(paired_files)} files (Balanced Mode, Paradigm: {paradigm}, Target FPS: {target_fps}, Continuous Cricket: {continuous_cricket_confidence})...")
     iterator = tqdm(paired_files, desc="Processing Videos", unit="vid", disable=not VERBOSE)
     
     for pair in iterator:
@@ -174,9 +174,11 @@ def create_dataset_sequences(paired_files, paradigm="rat", target_fps=30.0):
             
             is_mouse = (paradigm == "mouse" or pair.get('format') in ('diane', 'diane_parts'))
             if is_mouse:
-                pose_data = dataset_utils.load_mouse_dlc(pair['dlc_path'], video_fps)
+                mouse_cfg = MouseParadigmConfig()
+                mouse_cfg.continuous_cricket_confidence = continuous_cricket_confidence
+                pose_data = dataset_utils.load_mouse_dlc(pair['dlc_path'], video_fps, mouse_cfg=mouse_cfg)
                 if pose_data is None: continue
-                full_features, _ = dataset_utils.generate_mouse_features(pose_data, video_width, video_fps)
+                full_features, _ = dataset_utils.generate_mouse_features(pose_data, video_width, video_fps, config_obj=mouse_cfg)
             else:
                 processed_data = dataset_utils.load_and_process_dlc(pair['dlc_path'], video_fps)
                 if processed_data is None: continue
@@ -850,7 +852,8 @@ def main(
     recursive: Optional[bool] = None,
     verbose: bool = True,
     pretrained_weights_path: Optional[str] = None,
-    model_save_dir: Optional[str] = None
+    model_save_dir: Optional[str] = None,
+    continuous_cricket_confidence: bool = False
 ):
     # 1. Setup
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -862,7 +865,7 @@ def main(
         except Exception as e:
             if VERBOSE: print(f"Could not cap VRAM: {e}")
             
-    if verbose: print(f"Training on: {device} (Paradigm: {paradigm}, Canonical Target FPS: {target_fps})")
+    if verbose: print(f"Training on: {device} (Paradigm: {paradigm}, Canonical Target FPS: {target_fps}, Continuous Cricket: {continuous_cricket_confidence})")
     
     if datasets_config is not None:
         if recursive is not None:
@@ -898,7 +901,7 @@ def main(
         generate_verification_plots(pairs, target_fps=target_fps, save_dir=verif_dir, num_example_videos=2, verbose=verbose)
 
     # 2. Data (Standardized to target_fps across mixed 20/30 FPS videos)
-    X, y = create_dataset_sequences(pairs, paradigm=paradigm, target_fps=target_fps)
+    X, y = create_dataset_sequences(pairs, paradigm=paradigm, target_fps=target_fps, continuous_cricket_confidence=continuous_cricket_confidence)
     if len(X) == 0: return
 
     # Print Stats
@@ -1046,6 +1049,7 @@ def main(
                 'num_layers': num_layers,
                 'best_val_f1': best_val_f1,
                 'epoch': epoch,
+                'continuous_cricket_confidence': continuous_cricket_confidence,
             }
             torch.save(checkpoint_payload, os.path.join(save_path_dir, model_save_name))
             tqdm.write(f"--> New Best Model Saved! (F1: {best_val_f1:.4f}, FPS: {target_fps})")
@@ -1106,6 +1110,7 @@ if __name__ == "__main__":
         parser.add_argument("-q", "--quiet", action="store_false", dest="verbose", help="Disable verbose diagnostic logging")
         parser.add_argument("--pretrained", type=str, default=None, help="Path to pretrained model checkpoint")
         parser.add_argument("--save_dir", type=str, default=None, help="Directory to save model weights")
+        parser.add_argument("--continuous_cricket", "--continuous-cricket", action="store_true", default=False, help="Use continuous DLC cricket confidence [0, 1] instead of hard binary cutoff")
         args = parser.parse_args()
 
         main(
@@ -1119,7 +1124,8 @@ if __name__ == "__main__":
             recursive=args.recursive,
             verbose=args.verbose,
             pretrained_weights_path=args.pretrained,
-            model_save_dir=args.save_dir
+            model_save_dir=args.save_dir,
+            continuous_cricket_confidence=args.continuous_cricket
         )
 
     

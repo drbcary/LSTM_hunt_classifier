@@ -26,7 +26,13 @@ def extract_geometry(
     angle_diff_raw = (angle_diff + np.pi) % (2 * np.pi) - np.pi
     norm_angle_diff = angle_diff_raw / np.pi
 
-    cricket_visible = np.where(np.isnan(d_head_cricket), 0.0, 1.0)
+    use_continuous = getattr(config, 'continuous_cricket_confidence', False) if config else False
+    c_conf = pose_data.confidences.get('cricket', None) if use_continuous else None
+    if c_conf is not None:
+        c_conf_arr = np.asarray(c_conf, dtype=np.float32)
+        cricket_visible = np.where(np.isnan(d_head_cricket), 0.0, np.clip(c_conf_arr, 0.0, 1.0))
+    else:
+        cricket_visible = np.where(np.isnan(d_head_cricket), 0.0, 1.0)
 
     # Closing velocity and inverse time-to-collision
     closing_velocity = -np.diff(d_head_cricket, prepend=d_head_cricket[0:1]) * video_fps
@@ -76,7 +82,7 @@ def extract_geometry(
         FeatureItem("d_center_tail", "geometry", "Normalized distance from body center to tail"),
         FeatureItem("d_head_tail", "geometry", "Normalized distance from head to tail"),
         FeatureItem("angle_diff", "geometry", "Line of sight angle difference in [-1, 1]"),
-        FeatureItem("cricket_visible", "geometry", "Binary indicator if cricket is detected"),
+        FeatureItem("cricket_visible", "geometry", "Prey detection confidence score in [0, 1]"),
         FeatureItem("closing_velocity", "geometry", "Rate of approach toward cricket"),
         FeatureItem("inverse_ttc", "geometry", "Inverse time-to-collision (tanh scaled)"),
         FeatureItem("aim_correction_rate", "geometry", "Rate of heading correction (tanh scaled)"),
