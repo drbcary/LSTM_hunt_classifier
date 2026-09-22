@@ -71,13 +71,45 @@ class GenericExcelLabelParser(BaseLabelParser):
             except (ValueError, TypeError):
                 continue
 
+            approach = None
             if approach_c and pd.notna(row.get(approach_c)):
                 try:
-                    approach = int(row[approach_c])
+                    val = int(float(row[approach_c]))
+                    if val > enter:
+                        approach = val
                 except (ValueError, TypeError):
-                    approach = enter
-            else:
-                approach = enter
+                    pass
+
+            # Check latency / duration offset if approach was not in explicit frame column
+            if approach is None:
+                fps = float(kwargs.get('fps', 30.0))
+                for lat_cand in ['latency_to_attack_frames', 'latency_to_attack', 'latency', 'attack_latency_frames']:
+                    lat_c = self._find_col(cols_list, [lat_cand])
+                    if lat_c and pd.notna(row.get(lat_c)):
+                        try:
+                            lat_val = float(row[lat_c])
+                            if lat_val > 0:
+                                if 'frame' in lat_c.lower() or lat_val >= 20:
+                                    approach = enter + int(round(lat_val))
+                                else:
+                                    approach = enter + int(round(lat_val * fps))
+                                break
+                        except (ValueError, TypeError):
+                            pass
+
+                if approach is None and capture is not None:
+                    for dur_cand in ['pursuit_time_frames', 'attack_duration_frames', 'attack duration', 'pursuit_time']:
+                        dur_c = self._find_col(cols_list, [dur_cand])
+                        if dur_c and pd.notna(row.get(dur_c)):
+                            try:
+                                dur_val = float(row[dur_c])
+                                if dur_val > 0:
+                                    dur_f = int(round(dur_val)) if ('frame' in dur_c.lower() or dur_val >= 20) else int(round(dur_val * fps))
+                                    if capture > dur_f:
+                                        approach = capture - dur_f
+                                        break
+                            except (ValueError, TypeError):
+                                pass
 
             cons_end = None
             if cons_c and pd.notna(row.get(cons_c)):
@@ -134,6 +166,13 @@ class MultiSessionSheetParser(BaseLabelParser):
         # Forward fill animal column if only listed once at the top of the block
         df[self.animal_col] = df[self.animal_col].ffill()
 
+        fps = 30.0
+        if 'FPS' in df.columns and pd.notna(df['FPS'].dropna().iloc[0] if len(df['FPS'].dropna()) > 0 else None):
+            try: fps = float(df['FPS'].dropna().iloc[0])
+            except (ValueError, TypeError): fps = 30.0
+        elif kwargs.get('fps'):
+            fps = float(kwargs['fps'])
+
         for _, row in df.iterrows():
             if pd.isna(row.get(self.enter_col)) or pd.isna(row.get(self.capture_col)):
                 continue
@@ -147,12 +186,42 @@ class MultiSessionSheetParser(BaseLabelParser):
             except (ValueError, TypeError):
                 continue
 
-            approach = enter
-            if pd.notna(row.get(self.approach_col)):
-                try:
-                    approach = int(float(row[self.approach_col]))
-                except (ValueError, TypeError):
-                    approach = enter
+            approach = None
+            app_cols = [self.approach_col, 'Approach Start', 'Approach_Start_Frame', 'Pursuit_Frame', 'Pursuit_Start_Frame', 'Attack_Frame', 'Approach', 'Pursuit']
+            for ac in app_cols:
+                if ac in df.columns and pd.notna(row.get(ac)):
+                    try:
+                        v = int(float(row[ac]))
+                        if v > enter:
+                            approach = v
+                            break
+                    except (ValueError, TypeError):
+                        pass
+
+            if approach is None:
+                for lat_cand in ['Latency_to_Attack_Frames', 'Latency_to_Attack', 'Latency', 'Attack_Latency_Frames']:
+                    if lat_cand in df.columns and pd.notna(row.get(lat_cand)):
+                        try:
+                            lat_val = float(row[lat_cand])
+                            if lat_val > 0:
+                                lat_f = int(round(lat_val)) if ('frame' in lat_cand.lower() or lat_val >= 20) else int(round(lat_val * fps))
+                                approach = enter + lat_f
+                                break
+                        except (ValueError, TypeError):
+                            pass
+
+                if approach is None and capture is not None:
+                    for dur_cand in ['Pursuit_Time_Frames', 'Attack Duration', 'Attack_Duration_Frames', 'Pursuit_Time']:
+                        if dur_cand in df.columns and pd.notna(row.get(dur_cand)):
+                            try:
+                                dur_val = float(row[dur_cand])
+                                if dur_val > 0:
+                                    dur_f = int(round(dur_val)) if ('frame' in dur_cand.lower() or dur_val >= 20) else int(round(dur_val * fps))
+                                    if capture > dur_f:
+                                        approach = capture - dur_f
+                                        break
+                            except (ValueError, TypeError):
+                                pass
 
             cons_end = None
             if pd.notna(row.get(self.consumption_col)):

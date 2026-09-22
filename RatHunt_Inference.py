@@ -209,17 +209,20 @@ def events_to_sequence(events, num_frames):
         enter = max(0, min(num_frames, raw_enter))
         
         raw_pursuit = _safe_rat_frame_int(event.get('pursuit'))
-        pursuit = max(enter, min(num_frames, raw_pursuit if raw_pursuit is not None else enter))
-        
         raw_cap = _safe_rat_frame_int(event.get('capture'))
-        capture = max(pursuit, min(num_frames, raw_cap if raw_cap is not None else pursuit))
+        capture = max(enter, min(num_frames, raw_cap if raw_cap is not None else num_frames))
         
         raw_end = _safe_rat_frame_int(event.get('capture_end'))
         default_end = capture + getattr(dataset_utils, 'EATING_BUFFER', 300)
         eating_end = max(capture, min(num_frames, raw_end if raw_end is not None else default_end))
         
-        if pursuit > enter: seq[enter:pursuit] = 1 
-        if capture > pursuit: seq[pursuit:capture] = 2 
+        if raw_pursuit is not None and raw_pursuit > enter:
+            pursuit = min(capture, max(enter, raw_pursuit))
+            seq[enter:pursuit] = 1 
+            seq[pursuit:capture] = 2 
+        else:
+            seq[enter:capture] = 1
+            
         if eating_end > capture: seq[capture:eating_end] = 3 
             
     return seq
@@ -365,8 +368,9 @@ def generate_analyzed_excel(events, output_path, video_fps):
         capture_end = event.get('capture_end', capture + dataset_utils.EATING_BUFFER)
         remarks = event.get('remarks', '')
         
-        latency_frames = pursuit - enter if pursuit != -1 else 0
-        pursuit_dur_frames = capture - pursuit if pursuit != -1 else 0
+        has_pursuit = (pursuit is not None and pursuit != -1 and pursuit > enter)
+        latency_frames = (pursuit - enter) if has_pursuit else None
+        pursuit_dur_frames = (capture - pursuit) if has_pursuit else None
         total_frames = capture - enter
         
         include_status = 'Include'
@@ -377,7 +381,7 @@ def generate_analyzed_excel(events, output_path, video_fps):
             'Cricket_Number': i,
             'Enter_Frame': enter,
             'Enter_Time': frames_to_time(enter, video_fps),
-            'Pursuit_Frame': pursuit,
+            'Pursuit_Frame': pursuit if has_pursuit else None,
             'Capture_Frame': capture,
             'Capture_Time': frames_to_time(capture, video_fps),
             'Consumption_End_Frame': capture_end,
@@ -385,9 +389,9 @@ def generate_analyzed_excel(events, output_path, video_fps):
             'Time_to_Capture_Frames': total_frames,
             'Time_to_Capture': frames_to_time(total_frames, video_fps),
             'Pursuit_Time_Frames': pursuit_dur_frames,
-            'Pursuit_Time': frames_to_time(pursuit_dur_frames, video_fps),
+            'Pursuit_Time': frames_to_time(pursuit_dur_frames, video_fps) if pursuit_dur_frames is not None else "",
             'Latency_to_Attack_Frames': latency_frames,
-            'Latency_to_Attack': frames_to_time(latency_frames, video_fps),
+            'Latency_to_Attack': frames_to_time(latency_frames, video_fps) if latency_frames is not None else "",
             'Remarks': remarks,
             'Include?': include_status
         }

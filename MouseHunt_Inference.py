@@ -637,16 +637,20 @@ def events_to_sequence(events: List[Any], num_frames: int, paradigm: str = "mous
                 if end_eat > capture:
                     seq[capture:end_eat] = 4
         else:
-            pursuit = pursuit if pursuit is not None else enter
-            pursuit = max(enter, min(num_frames, pursuit))
-            capture = capture if capture is not None else pursuit
-            capture = max(pursuit, min(num_frames, capture))
+            capture = capture if capture is not None else num_frames
+            capture = max(enter, min(num_frames, capture))
             end_eat = eating_end if eating_end is not None else min(num_frames, capture + 300)
             end_eat = max(capture, min(num_frames, end_eat))
 
-            if pursuit > enter: seq[enter:pursuit] = 1           # Stalking
-            if capture > pursuit: seq[pursuit:capture] = 2       # Pursuit
-            if end_eat > capture: seq[capture:end_eat] = 3       # Eating
+            if pursuit is not None and pursuit > enter:
+                pursuit = min(capture, max(enter, pursuit))
+                seq[enter:pursuit] = 1           # Stalking / Cricket Present (Orange)
+                seq[pursuit:capture] = 2         # Pursuit / Attack (Red)
+            else:
+                seq[enter:capture] = 1           # Entire pre-capture duration is Stalking (Orange)
+
+            if end_eat > capture:
+                seq[capture:end_eat] = 3         # Eating (Green)
 
     return seq
 
@@ -797,17 +801,34 @@ def load_ground_truth_sequence(
     # 2. Rat Formats (Lucas or Dan)
     try:
         import dataset_utils
-        if label_format == 'dan' or (dlc_path and 'dan' in str(label_format).lower()):
+        is_dan_file = False
+        if os.path.isfile(label_path):
+            try:
+                hdr = pd.read_csv(label_path, nrows=2) if label_path.endswith('.csv') else pd.read_excel(label_path, nrows=2)
+                hdr_cols = [str(c).strip().lower() for c in hdr.columns]
+                if 'animal' in hdr_cols and any(k in hdr_cols for k in ('session', 'cricket', 'day', 'on')):
+                    is_dan_file = True
+            except Exception:
+                pass
+
+        if label_format == 'dan' or is_dan_file or (dlc_path and 'dan' in str(label_format).lower()) or 'dan' in os.path.basename(label_path).lower() or 'crickethunttimes' in os.path.basename(label_path).lower():
             if dlc_path is None:
                 print("Warning: dlc_path required to match session for Dan format.")
                 return None, None
-            dan_hunts = dataset_utils.load_dan_labels(os.path.dirname(label_path))
+            dan_hunts = dataset_utils.load_dan_labels(label_path)
             base = os.path.basename(dlc_path)
             match = re.search(r'([a-zA-Z]+\d+)_D(\d+)_HS(\d+)', base, re.IGNORECASE)
             if match:
                 animal = match.group(1).upper()
+                day = int(match.group(2))
                 session = int(match.group(3))
-                valid_hunts = dan_hunts.get((animal, session), [])
+                norm_animal = re.sub(r'([A-Z]+)0*(\d+)', r'\1\2', animal)
+                valid_hunts = (
+                    dan_hunts.get((animal, day, session)) or 
+                    dan_hunts.get((norm_animal, day, session)) or 
+                    dan_hunts.get((animal, session)) or 
+                    dan_hunts.get((norm_animal, session), [])
+                )
                 true_seq = events_to_sequence(valid_hunts, num_frames or 100000, paradigm="rat")
                 return true_seq, valid_hunts
         else:
@@ -2151,11 +2172,28 @@ def load_and_align_evaluation_data(
                 for _, row in pred_df.iterrows():
                     enter = int(row['Enter_Frame']) if pd.notna(row.get('Enter_Frame')) else 0
                     first_app = int(row['First_Approach_Frame']) if pd.notna(row.get('First_Approach_Frame')) else None
-                    final_app = int(row['Final_Approach_Frame']) if pd.notna(row.get('Final_Approach_Frame')) else (
-                        int(row['Pursuit_Frame']) if pd.notna(row.get('Pursuit_Frame')) else None
-                    )
                     capture = int(row['Capture_Frame']) if pd.notna(row.get('Capture_Frame')) else None
                     cons_end = int(row['Consumption_End_Frame']) if pd.notna(row.get('Consumption_End_Frame')) else None
+                    
+                    final_app = None
+                    for c_cand in ['Final_Approach_Frame', 'Pursuit_Frame', 'Pursuit_Start_Frame', 'Approach_Start_Frame', 'Approach Start']:
+                        if c_cand in row and pd.notna(row[c_cand]):
+                            try:
+                                v = int(float(row[c_cand]))
+                                if v > enter:
+                                    final_app = v
+                                    break
+                            except (ValueError, TypeError): pass
+                    if final_app is None:
+                        for l_cand in ['Latency_to_Attack_Frames', 'Latency_to_Pursuit_Frames', 'Attack_Latency_Frames']:
+                            if l_cand in row and pd.notna(row[l_cand]):
+                                try:
+                                    lat = int(float(row[l_cand]))
+                                    if lat > 0:
+                                        final_app = enter + lat
+                                        break
+                                except (ValueError, TypeError): pass
+
                     pred_events.append({
                         'enter': enter,
                         'first_approach': first_app,

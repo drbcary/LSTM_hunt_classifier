@@ -248,12 +248,21 @@ class TimelineWidget(QWidget):
         
         rect_w = self.rect().width()
         for s, e in zip(starts, ends):
-            val = label_array[s]
+            val = int(label_array[s])
             x1 = int((s / self.total_frames) * w + self.offset_x)
             x2 = int((e / self.total_frames) * w + self.offset_x)
             
             if x2 > 0 and x1 < rect_w:
-                painter.fillRect(x1, y_pos, max(1, x2 - x1), bar_h, self.colors.get(val, QColor(0, 0, 0)))
+                col = self.colors.get(val)
+                if col is None:
+                    # Graceful cross-paradigm fallback:
+                    if self.paradigm == "rat" and val == 4:
+                        col = self.colors.get(3, QColor(0, 255, 0)) # Eating in rat is 3 (Green)
+                    elif self.paradigm == "mouse" and val == 3 and len(self.colors) == 5:
+                        col = self.colors.get(3, QColor(214, 39, 40)) # Final approach in mouse
+                    else:
+                        col = QColor(140, 140, 140)
+                painter.fillRect(x1, y_pos, max(1, x2 - x1), bar_h, col)
 
     def _draw_badge(self, painter, text, y_pos, h_pos):
         badge_w = 90
@@ -672,10 +681,51 @@ class ReviewGUI(QMainWindow):
             else:
                 self.btn_paradigm.setText("Paradigm: Rat (4-Class)")
                 self.btn_paradigm.setStyleSheet("background-color: #455A64; color: white; font-weight: bold; padding: 4px 8px;")
+
+        # Re-convert loaded events to the new paradigm sequence
+        if getattr(self, 'loaded_events', None) and self.total_frames > 0:
+            if paradigm == "mouse":
+                self.labels = MouseHunt_Inference.events_to_sequence(self.loaded_events, self.total_frames, paradigm="mouse")
+            else:
+                self.labels = MouseHunt_Inference.events_to_sequence(self.loaded_events, self.total_frames, paradigm="rat")
+            self.timeline.set_data(self.labels, self.probs, self.current_frame, gt_labels=self.gt_labels)
+
+        # Re-slice probabilities if full probability DataFrame is cached
+        if getattr(self, 'prob_df', None) is not None:
+            self._update_probs_for_paradigm()
+
+        # Re-match ground truth if active
+        if getattr(self, 'gt_path', None):
+            self.match_and_load_gt()
+
         if not self.is_playing and self.cap:
             self.set_frame(self.current_frame)
         elif hasattr(self, '_update_hud'):
             self._update_hud()
+
+    def _update_probs_for_paradigm(self):
+        if not hasattr(self, 'prob_df') or self.prob_df is None:
+            return
+        try:
+            if self.paradigm == "mouse":
+                cols_needed = ['Background', 'Cricket Present', 'First Approach', 'Final Approach', 'Eating']
+                if all(c in self.prob_df.columns for c in cols_needed):
+                    self.probs = self.prob_df[cols_needed].values
+                elif self.prob_df.shape[1] >= 5:
+                    self.probs = self.prob_df.values[:, :5]
+                else:
+                    self.probs = self.prob_df.values
+            else:
+                stalk_col = 'Cricket Present' if 'Cricket Present' in self.prob_df.columns else ('Stalking' if 'Stalking' in self.prob_df.columns else self.prob_df.columns[1])
+                eat_col = 'Eating' if 'Eating' in self.prob_df.columns else self.prob_df.columns[min(3, len(self.prob_df.columns)-1)]
+                pursuit_col = 'Pursuit' if 'Pursuit' in self.prob_df.columns else ('Final Approach' if 'Final Approach' in self.prob_df.columns else self.prob_df.columns[min(2, len(self.prob_df.columns)-1)])
+                bg_col = 'Background' if 'Background' in self.prob_df.columns else self.prob_df.columns[0]
+                self.probs = self.prob_df[[bg_col, stalk_col, pursuit_col, eat_col]].values
+            if hasattr(self, 'timeline'):
+                self.timeline.probs = self.probs
+                self.timeline.update()
+        except Exception as e:
+            print(f"Error updating probs for paradigm {self.paradigm}: {e}")
         
     def eventFilter(self, obj, event):
         if event.type() == event.Type.KeyPress:
@@ -921,13 +971,13 @@ class ReviewGUI(QMainWindow):
             self.gt_labels = y_true
             self.timeline.set_data(self.labels, self.probs, self.current_frame, gt_labels=self.gt_labels)
             print(f"Comparison Mode: Matched manual labels from {matched_source} ({len(true_hunts)} hunts)")
-            curr_text = self.lbl_info.text()
+            curr_text = re.sub(r'\s*\|\s*GT:.*$', '', self.lbl_info.text())
             self.lbl_info.setText(f"{curr_text} | GT: {matched_source} ({len(true_hunts)} hunts)")
         else:
             self.gt_labels = None
             self.timeline.set_data(self.labels, self.probs, self.current_frame, gt_labels=None)
             print(f"Comparison Mode: No matching manual label found for {clean_base} in {self.gt_path}")
-            curr_text = self.lbl_info.text()
+            curr_text = re.sub(r'\s*\|\s*GT:.*$', '', self.lbl_info.text())
             self.lbl_info.setText(f"{curr_text} | GT: No match found in {matched_source}")
             
         if not self.is_playing and self.cap:
@@ -1164,19 +1214,12 @@ class ReviewGUI(QMainWindow):
                 
         if found_prob:
             try:
-                prob_df = pd.read_csv(found_prob)
-                if prob_df.shape[1] >= 5 or any('approach' in str(c).lower() for c in prob_df.columns):
+                self.prob_df = pd.read_csv(found_prob)
+                if self.prob_df.shape[1] >= 5 or any('approach' in str(c).lower() for c in self.prob_df.columns):
                     self.set_paradigm("mouse")
-                    cols_needed = ['Background', 'Cricket Present', 'First Approach', 'Final Approach', 'Eating']
-                    if all(c in prob_df.columns for c in cols_needed):
-                        self.probs = prob_df[cols_needed].values
-                    else:
-                        self.probs = prob_df.values[:, :5]
                 else:
                     self.set_paradigm("rat")
-                    stalk_col = 'Cricket Present' if 'Cricket Present' in prob_df.columns else ('Stalking' if 'Stalking' in prob_df.columns else prob_df.columns[1])
-                    eat_col = 'Eating' if 'Eating' in prob_df.columns else prob_df.columns[3]
-                    self.probs = prob_df[['Background', stalk_col, 'Pursuit', eat_col]].values
+                self._update_probs_for_paradigm()
                 print(f"Loaded probabilities from {os.path.basename(found_prob)} (Paradigm={self.paradigm}, Shape={self.probs.shape if self.probs is not None else 'None'})")
             except Exception as e:
                 print(f"Failed to load probs: {e}")
@@ -1274,24 +1317,128 @@ class ReviewGUI(QMainWindow):
                     )
                     return
             
-            # 2. Check for Mouse Analyzed Excel
-            if seq is None and 'Enter_Frame' in df.columns and ('First_Approach_Frame' in df.columns or 'Capture_Frame' in df.columns):
+            # 2. Check for Analyzed Excel / CSV (Mouse or Rat)
+            cols_lower = {str(c).strip().lower(): str(c).strip() for c in df.columns}
+            enter_c = next((cols_lower[k] for k in ['enter_frame', 'enter', 'start_frame'] if k in cols_lower), None)
+            capture_c = next((cols_lower[k] for k in ['capture_frame', 'capture', 'strike_frame'] if k in cols_lower), None)
+            
+            # Check if this matches a single-session or analyzed spreadsheet
+            has_analyzed_timing = any(k in cols_lower for k in (
+                'first_approach_frame', 'final_approach_frame', 'pursuit_frame', 'pursuit_start_frame',
+                'approach start', 'approach_start_frame', 'attack_frame', 'latency_to_attack_frames',
+                'pursuit_time_frames', 'attack_duration_frames', 'time_to_capture_frames'
+            ))
+
+            if seq is None and enter_c and (capture_c or has_analyzed_timing):
                 events = []
+                file_fps = self.video_fps or 30.0
+                if 'fps' in cols_lower:
+                    try:
+                        fps_val = float(df[cols_lower['fps']].dropna().iloc[0])
+                        if fps_val > 0: file_fps = fps_val
+                    except Exception:
+                        pass
+
                 for _, row in df.iterrows():
-                    enter = _safe_int(row.get('Enter_Frame'))
+                    enter = _safe_int(row.get(enter_c))
                     if enter is None:
                         continue
+                    
+                    capture = _safe_int(row.get(capture_c)) if capture_c else None
+                    consumption = None
+                    for c_cand in ['consumption_end_frame', 'consumption', 'eating_end_frame', 'capture_end_frame']:
+                        if c_cand in cols_lower:
+                            consumption = _safe_int(row.get(cols_lower[c_cand]))
+                            if consumption is not None: break
+
+                    # Robustly resolve first approach (5-class mouse)
+                    first_app = None
+                    for f_cand in ['first_approach_frame', 'first_approach_start_frame', 'first_approach', 'first_app_frame']:
+                        if f_cand in cols_lower:
+                            first_app = _safe_int(row.get(cols_lower[f_cand]))
+                            if first_app is not None and first_app > 0: break
+                    if first_app is None and 'latency_to_first_approach_frames' in cols_lower:
+                        lat_fa = _safe_int(row.get(cols_lower['latency_to_first_approach_frames']))
+                        if lat_fa is not None and lat_fa > 0:
+                            first_app = enter + lat_fa
+
+                    # Robustly resolve pursuit / final approach (4-class rat or 5-class mouse)
+                    final_app = None
+                    # 1. Direct frame columns
+                    for p_cand in [
+                        'final_approach_frame', 'pursuit_frame', 'pursuit_start_frame',
+                        'approach_start_frame', 'approach start', 'attack_frame',
+                        'approach_frame', 'final_approach', 'pursuit', 'approach'
+                    ]:
+                        if p_cand in cols_lower:
+                            val = _safe_int(row.get(cols_lower[p_cand]))
+                            if val is not None and val > 0 and (val > enter or len(df) == 1):
+                                final_app = val
+                                break
+
+                    # 2. Frame latency offset (e.g. Lucas analyzed: Latency_to_Attack_Frames)
+                    if final_app is None or (enter is not None and final_app == enter):
+                        for l_cand in ['latency_to_attack_frames', 'latency_to_pursuit_frames', 'attack_latency_frames']:
+                            if l_cand in cols_lower:
+                                lat = _safe_int(row.get(cols_lower[l_cand]))
+                                if lat is not None and lat > 0:
+                                    final_app = enter + lat
+                                    break
+
+                    # 3. Seconds latency offset (e.g. Latency column in behavior CSV)
+                    if final_app is None or (enter is not None and final_app == enter):
+                        for s_cand in ['latency', 'latency_to_attack', 'time_to_attack']:
+                            if s_cand in cols_lower:
+                                raw_s = row.get(cols_lower[s_cand])
+                                if raw_s is not None and pd.notna(raw_s):
+                                    try:
+                                        lat_s = float(raw_s)
+                                        if lat_s > 0:
+                                            final_app = enter + int(round(lat_s * file_fps))
+                                            break
+                                    except (ValueError, TypeError):
+                                        pass
+
+                    # 4. Pursuit duration backwards from capture
+                    if (final_app is None or (enter is not None and final_app == enter)) and capture is not None:
+                        for dur_cand in ['pursuit_time_frames', 'attack_duration_frames']:
+                            if dur_cand in cols_lower:
+                                pdur = _safe_int(row.get(cols_lower[dur_cand]))
+                                if pdur is not None and pdur > 0 and capture > pdur:
+                                    final_app = capture - pdur
+                                    break
+                        if final_app is None or final_app == enter:
+                            for dur_s_cand in ['attack duration', 'pursuit_time']:
+                                if dur_s_cand in cols_lower:
+                                    raw_dur = row.get(cols_lower[dur_s_cand])
+                                    if raw_dur is not None and pd.notna(raw_dur):
+                                        try:
+                                            dur_s = float(raw_dur)
+                                            if dur_s > 0 and capture > int(round(dur_s * file_fps)):
+                                                final_app = capture - int(round(dur_s * file_fps))
+                                                break
+                                        except (ValueError, TypeError):
+                                            pass
+
+                    # Avoid invalid pursuit <= enter
+                    if final_app is not None and final_app <= enter:
+                        final_app = None
+
                     events.append({
                         'enter': enter,
-                        'first_approach': _safe_int(row.get('First_Approach_Frame')),
-                        'final_approach': _safe_int(row.get('Final_Approach_Frame')),
-                        'pursuit_start': _safe_int(row.get('Final_Approach_Frame')),
-                        'capture': _safe_int(row.get('Capture_Frame')),
-                        'consumption_end': _safe_int(row.get('Consumption_End_Frame'))
+                        'first_approach': first_app,
+                        'final_approach': final_app,
+                        'pursuit_start': final_app,
+                        'pursuit': final_app,
+                        'capture': capture,
+                        'consumption_end': consumption
                     })
-                self.set_paradigm("mouse")
-                seq = MouseHunt_Inference.events_to_sequence(events, self.total_frames, paradigm="mouse")
-                loaded_msg = f"Loaded Mouse Analyzed Labels: {os.path.basename(path)} ({len(events)} hunts)"
+
+                if events:
+                    self.loaded_events = events
+                    seq = MouseHunt_Inference.events_to_sequence(events, self.total_frames, paradigm=self.paradigm)
+                    p_name = "Mouse" if self.paradigm == "mouse" else "Rat"
+                    loaded_msg = f"Loaded {p_name} Analyzed Labels: {os.path.basename(path)} ({len(events)} hunts)"
 
             # 3. Check for Dan Format
             if seq is None:
@@ -1303,12 +1450,20 @@ class ReviewGUI(QMainWindow):
                         match = re.search(r'([a-zA-Z]+\d+)_D(\d+)_HS(\d+)', base, re.IGNORECASE)
                         if match:
                             v_animal = match.group(1).upper()
+                            v_day = int(match.group(2))
                             v_session = int(match.group(3))
-                            hunts = dan_dict.get((v_animal, v_session), [])
+                            norm_animal = re.sub(r'([A-Z]+)0*(\d+)', r'\1\2', v_animal)
+                            hunts = (
+                                dan_dict.get((v_animal, v_day, v_session)) or
+                                dan_dict.get((norm_animal, v_day, v_session)) or
+                                dan_dict.get((v_animal, v_session)) or
+                                dan_dict.get((norm_animal, v_session), [])
+                            )
                     if not hunts and len(dan_dict) == 1:
                         hunts = next(iter(dan_dict.values()))
                     if hunts:
                         self.set_paradigm("rat")
+                        self.loaded_events = hunts
                         seq = dataset_utils.hunts_to_sequence(hunts, self.total_frames)
                         loaded_msg = f"Loaded Dan Labels: {os.path.basename(path)} ({len(hunts)} hunts)"
                         self.gt_path = path
@@ -1628,7 +1783,7 @@ class ReviewGUI(QMainWindow):
                 if in_hunt and current_event and current_event['capture'] != -1 and val in (1, 2):
                     current_event['capture_end'] = s
                     if current_event['pursuit'] == -1:
-                        current_event['pursuit'] = current_event['enter']
+                        current_event['pursuit'] = None
                     events.append(current_event)
                     current_event = {'enter': s, 'pursuit': s if val == 2 else -1, 'capture': -1, 'capture_end': -1}
                     in_hunt = True
@@ -1649,7 +1804,7 @@ class ReviewGUI(QMainWindow):
                     if val == 0:
                         current_event['capture_end'] = s
                         if current_event['pursuit'] == -1:
-                            current_event['pursuit'] = current_event['enter']
+                            current_event['pursuit'] = None
                         if current_event['capture'] == -1:
                             current_event['capture'] = current_event['capture_end']
                         events.append(current_event)
@@ -1659,7 +1814,7 @@ class ReviewGUI(QMainWindow):
             if in_hunt and current_event:
                 current_event['capture_end'] = len(lbls)
                 if current_event['pursuit'] == -1:
-                    current_event['pursuit'] = current_event['enter']
+                    current_event['pursuit'] = None
                 if current_event['capture'] == -1:
                     current_event['capture'] = current_event['capture_end']
                 events.append(current_event)

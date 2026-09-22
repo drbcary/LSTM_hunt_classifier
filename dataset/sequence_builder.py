@@ -51,11 +51,12 @@ def events_to_label_sequence(events: List[HuntEvent], num_frames: int, eating_bu
             if eating_end > capture:
                 seq[capture:eating_end] = 4
         else:
-            pursuit = max(enter, min(num_frames, app_start_val if app_start_val is not None else enter))
-            if pursuit > enter:
+            if app_start_val is not None and app_start_val > enter:
+                pursuit = min(capture, max(enter, app_start_val))
                 seq[enter:pursuit] = 1
-            if capture > pursuit:
                 seq[pursuit:capture] = 2
+            else:
+                seq[enter:capture] = 1
             if eating_end > capture:
                 seq[capture:eating_end] = 3
     return seq

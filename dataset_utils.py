@@ -413,25 +413,42 @@ def parse_dan_label_file(file_path):
     h_map = parser.parse_file(file_path)
     out = {}
     for (animal, day, session), events in h_map.items():
-        key = (animal, session)
-        if key not in out: out[key] = []
-        for ev in events:
-            out[key].append({
+        event_dicts = [
+            {
                 'enter': ev.enter,
                 'pursuit_start': ev.approach_start,
                 'capture': ev.capture,
                 'consumption_end': ev.consumption_end
-            })
+            }
+            for ev in events
+        ]
+        animal_clean = animal.strip().upper()
+        # Support full (Animal, Day, Session) matching
+        out[(animal_clean, int(day), int(session))] = event_dicts
+        # Normalized animal without leading zeros (e.g. XP3 vs XP03)
+        norm_animal = re.sub(r'([A-Z]+)0*(\d+)', r'\1\2', animal_clean)
+        out[(norm_animal, int(day), int(session))] = event_dicts
+        # Fallback 2-tuple (Animal, Session)
+        if (animal_clean, int(session)) not in out:
+            out[(animal_clean, int(session))] = event_dicts
+        if (norm_animal, int(session)) not in out:
+            out[(norm_animal, int(session))] = event_dicts
     return out
 
 def load_dan_labels(label_dir):
     dan_hunts = {}
-    label_files = glob.glob(os.path.join(label_dir, '*.xlsx')) + glob.glob(os.path.join(label_dir, '*.csv'))
+    if os.path.isfile(label_dir):
+        label_files = [label_dir]
+    elif os.path.isdir(label_dir):
+        label_files = glob.glob(os.path.join(label_dir, '*.xlsx')) + glob.glob(os.path.join(label_dir, '*.csv'))
+    else:
+        label_files = []
     for lf in label_files:
         try:
             fh = parse_dan_label_file(lf)
             for k, v in fh.items():
-                if k not in dan_hunts: dan_hunts[k] = []
+                if k not in dan_hunts:
+                    dan_hunts[k] = []
                 dan_hunts[k].extend(v)
         except Exception as e:
             if VERBOSE: print(f"Error reading {lf}: {e}")
