@@ -12,6 +12,7 @@ from scipy.sparse.csgraph import connected_components
 from config.base_config import BaseParadigmConfig, sec_to_frames
 from config.mouse_config import MousePoseSchema, MouseParadigmConfig
 from .keypoints import PoseData
+from .crop import read_dlc_table
 
 def extract_filename_timestamp(filepath: str) -> Tuple[int, int, str]:
     """
@@ -223,37 +224,22 @@ class DLCAdapter:
             if isinstance(filepath, (list, tuple)):
                 if len(filepath) == 0:
                     return None
-                if len(filepath) == 1:
-                    single_path = filepath[0]
-                    if single_path.endswith('.h5'):
-                        df = pd.read_hdf(single_path)
-                    else:
-                        df = pd.read_csv(single_path, header=[0, 1, 2], index_col=0)
-                else:
-                    sorted_files = sorted(filepath, key=extract_filename_timestamp)
-                    dfs = []
-                    for f in sorted_files:
-                        if f.endswith('.h5'):
-                            part_df = pd.read_hdf(f)
-                        else:
-                            part_df = pd.read_csv(f, header=[0, 1, 2], index_col=0)
-                        if not isinstance(part_df, pd.DataFrame):
-                            part_df = pd.DataFrame(part_df)
-                        dfs.append(part_df)
-                    df = pd.concat(dfs, ignore_index=True)
+                sorted_files = sorted(filepath, key=extract_filename_timestamp)
+                parts = [read_dlc_table(f) for f in sorted_files]
+                df = pd.concat([p[0] for p in parts], ignore_index=True) if len(parts) > 1 else parts[0][0]
+                offsets = [p[1] for p in parts]
             elif isinstance(filepath, str):
-                if filepath.endswith('.h5'):
-                    df = pd.read_hdf(filepath)
-                else:
-                    df = pd.read_csv(filepath, header=[0, 1, 2], index_col=0)
+                df, single_offset = read_dlc_table(filepath)
+                offsets = [single_offset]
             else:
                 return None
         except Exception as e:
             print(f"Error loading DLC file(s) {filepath}: {e}")
             return None
 
-        if not isinstance(df, pd.DataFrame):
-            df = pd.DataFrame(df)
+        crop_offset = offsets[0]
+        if any((o.dx, o.dy) != (crop_offset.dx, crop_offset.dy) for o in offsets[1:]):
+            print(f"Warning: multi-part DLC files have differing crop offsets: {[(o.dx, o.dy, o.source) for o in offsets]}")
 
         scorer = str(df.columns.get_level_values(0)[0])
         num_frames = len(df)
@@ -473,5 +459,6 @@ class DLCAdapter:
                 'raw_cricket': raw_final_c_conf,
                 'is_blurry': is_blurry,
                 'is_immo': is_immo
-            }
+            },
+            crop_offset=crop_offset
         )

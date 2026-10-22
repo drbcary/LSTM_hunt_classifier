@@ -1,0 +1,19 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "RatHunt Inference: NP01 single video",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/RatHunt_Inference.py",
+            "cwd": "${workspaceFolder}",
+            "python": "${workspaceFolder}/.venv/Scripts/python.exe",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "args": [
+                "--video", "D:\\NEUROPIXEL_DATA\\NP01\\VIDEO\\NP01-09112026131140-0000.avi",
+                "--model", "${workspaceFolder}\\models\\BGadd_feat22_dim256_lay3_ep30_valf1=0.8431.pth"
+            ]
+        }
+    ]
+}

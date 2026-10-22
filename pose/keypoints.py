@@ -2,6 +2,8 @@ import numpy as np
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Union
 
+from .crop import CropOffset, NO_CROP
+
 def calculate_angle_3pts(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> np.ndarray:
     """
     Calculates angle at vertex b formed by points a, b, c in degrees [0, 180].
@@ -48,6 +50,9 @@ class PoseData:
     
     # Likelihood / confidence arrays (N,)
     confidences: Dict[str, np.ndarray] = field(default_factory=dict)
+
+    # DLC crop offset already added to all coordinates (see pose/crop.py)
+    crop_offset: CropOffset = NO_CROP
 
     @property
     def primary_tail_end(self) -> np.ndarray:

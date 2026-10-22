@@ -7,6 +7,7 @@ from tqdm import tqdm
 
 # Pull in DLC thresholds from dataset_utils
 import dataset_utils
+from pose.crop import read_dlc_table
 
 rat_thresh = dataset_utils.RAT_LIKELIHOOD_THRESH
 cricket_thresh = dataset_utils.CRICKET_LIKELIHOOD_THRESH
@@ -229,9 +230,9 @@ def create_hunting_video_clip(video_path, probs, preds, start_frame, end_frame, 
                 if isinstance(dlc_path, (list, tuple)):
                     from pose.dlc_adapter import extract_filename_timestamp
                     sorted_files = sorted(dlc_path, key=extract_filename_timestamp)
-                    df = pd.concat([pd.read_csv(f, header=[0, 1, 2], index_col=0) for f in sorted_files], ignore_index=True)
+                    df = pd.concat([read_dlc_table(f)[0] for f in sorted_files], ignore_index=True)
                 else:
-                    df = pd.read_csv(dlc_path, header=[0, 1, 2], index_col=0)
+                    df = read_dlc_table(dlc_path)[0]
                 scorer = str(df.columns.get_level_values(0)[0])
                 
                 if not is_mouse and show_confidence:

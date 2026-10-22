@@ -2,6 +2,8 @@
 import os
 import re
 import glob
+import sys
+from tqdm import tqdm
 from datetime import timedelta
 import warnings
 import copy
@@ -43,6 +45,7 @@ except ImportError:
 
 from LSTM_model_training import HuntingBiLSTM
 from VidLabeler import create_hunting_video_clip
+from pose.crop import effective_video_width
 
 
 
@@ -411,7 +414,25 @@ def generate_analyzed_excel(events, output_path, video_fps):
 # 7. Main Batch Processor
 # ==========================================
 
-def batch_process_dlc_folder(folder_path, model_path, device, label_folder=None, label_format=None, window_size=6000, step_size=1000, output_subdir="excel_files", plot_subdir="plots", prob_subdir=None):
+def find_dlc_for_video(video_path):
+    """Returns the DLC tracking CSV next to video_path (e.g. <video_stem>DLC_resnet50_....csv), or None."""
+    stem = os.path.splitext(video_path)[0]
+    cands = [f for f in glob.glob(glob.escape(stem) + "DLC*.csv") if not f.lower().endswith(('_probs.csv', '_analyzed.csv'))]
+    return sorted(cands)[0] if cands else None
+
+def batch_process_dlc_folder(folder_path, model_path, device, label_folder=None, label_format=None, window_size=6000, step_size=1000, output_subdir="excel_files", plot_subdir="plots", prob_subdir=None, dlc_files=None, start_min=None, end_min=None):
+    """
+    Runs inference on every DLC CSV in folder_path, or only on dlc_files (a path or list of paths).
+    If folder_path is None, outputs go in the folder of the first DLC file.
+    start_min/end_min restrict the model to that time range (minutes); other frames are labeled Background.
+    """
+    if isinstance(dlc_files, str):
+        dlc_files = [dlc_files]
+    if not folder_path:
+        if not dlc_files:
+            raise ValueError("Provide folder_path and/or dlc_files.")
+        folder_path = os.path.dirname(os.path.abspath(dlc_files[0]))
+
     # 1. Load Model
     print(f"Loading Model from {model_path}...")
     model = HuntingBiLSTM(input_dim=22, hidden_dim=256, num_layers=3, num_classes=4).to(device)
@@ -438,11 +459,18 @@ def batch_process_dlc_folder(folder_path, model_path, device, label_folder=None,
         prob_dir = folder_path
     
     # 3. Find Files
-    dlc_files = [f for f in glob.glob(os.path.join(folder_path, "*.csv")) if not f.endswith('_probs.csv')]
+    if dlc_files:
+        missing = [f for f in dlc_files if not os.path.exists(f)]
+        if missing:
+            raise FileNotFoundError(f"DLC file(s) not found: {missing}")
+    else:
+        dlc_files = [f for f in glob.glob(os.path.join(folder_path, "*.csv")) if not f.endswith('_probs.csv')]
     print(f"Found {len(dlc_files)} DLC files.")
     
-    for dlc_file in dlc_files:
+    file_bar = tqdm(dlc_files, desc="DLC files", unit="file")
+    for dlc_file in file_bar:
         filename = os.path.basename(dlc_file)
+        file_bar.set_postfix_str(filename[:40])
         
         # Universal cleanup: strip DLC output suffix and file extension
         clean_base = re.sub(r'DLC_resnet50.*\.csv$', '', filename, flags=re.IGNORECASE)
@@ -461,13 +489,16 @@ def batch_process_dlc_folder(folder_path, model_path, device, label_folder=None,
                 curr_label_format = 'dan'
             
         output_path = os.path.join(output_dir, output_filename)
-        print(f"Processing {filename} -> {output_filename}...")
+        tqdm.write(f"Processing {filename} -> {output_filename}...")
         
         try:
             # B. Run Model via sliding windows (using matching settings from single inference)
+            _, _, file_fps = dataset_utils.get_video_params(dlc_file)
             probs, preds = run_inference_on_video(dlc_file, model, device, 
                                                   window_size=window_size, step_size=step_size, 
-                                                  return_all_windows=True)
+                                                  return_all_windows=True,
+                                                  start_frame=int(start_min * 60 * file_fps) if start_min is not None else None,
+                                                  end_frame=int(end_min * 60 * file_fps) if end_min is not None else None)
             
             if probs is None: continue
             
@@ -525,30 +556,65 @@ def batch_process_dlc_folder(folder_path, model_path, device, label_folder=None,
             if len(events) > 0:
                 generate_analyzed_excel(events, output_path, video_fps)
             else:
-                print(f"  -> No hunts detected in {filename}")
+                tqdm.write(f"  -> No hunts detected in {filename}")
                 
         except Exception as e:
-            print(f"Error processing {filename}: {e}")
+            tqdm.write(f"Error processing {filename}: {e}")
             import traceback
             traceback.print_exc()
+    file_bar.close()
 
-def run_inference_on_video(dlc_path, model, device, use_sliding_window=True, window_size=2000, step_size=500, return_all_windows=False, use_max_prob=False):
+def run_inference_on_video(dlc_path, model, device, use_sliding_window=True, window_size=2000, step_size=500, return_all_windows=False, use_max_prob=False, show_progress=True, start_frame=None, end_frame=None):
     """
     Runs the trained model on a full video DLC file using an overlapping sliding window.
+    If start_frame/end_frame are given, only that range is run through the model; frames outside it
+    get Background probability so outputs stay aligned with the full video.
     Returns:
         probs: (N, 4) numpy array of class probabilities
         preds: (N,) numpy array of predicted class indices
     """
-    print(f"Processing {dlc_path}...")
+    tqdm.write(f"Processing {dlc_path}...")
     
     # 1. Process Data
     video_width, _, video_fps = dataset_utils.get_video_params(dlc_path)
+    # Normalize by the DLC crop box (approximately the arena) rather than the full camera frame
+    video_width = effective_video_width(dlc_path, video_width)
     processed_data = dataset_utils.load_and_process_dlc(dlc_path, video_fps, filter_poops=True, poop_dist_thresh=6, poop_thresh=0.9)
     if processed_data is None:
         return None, None
         
     rat_head, rat_mid, rat_butt, rat_tail, cricket_pos = processed_data
     features = dataset_utils.generate_features(rat_head, rat_mid, rat_butt, rat_tail, cricket_pos, video_width, video_fps)
+
+    total_frames = len(features)
+    s = max(0, int(start_frame or 0))
+    e = min(total_frames, int(end_frame)) if end_frame is not None else total_frames
+    if s > 0 or e < total_frames:
+        tqdm.write(f"  Running model on frames {s}-{e} of {total_frames}")
+
+    probs, preds = _infer_features(features[s:e], model, device, use_sliding_window, window_size, step_size,
+                                   return_all_windows, use_max_prob, show_progress)
+    if s == 0 and e == total_frames:
+        return probs, preds
+
+    # Embed the sliced results back into full-length arrays (Background outside the range)
+    def _embed(p):
+        full = np.zeros((total_frames, p.shape[1]), dtype=p.dtype)
+        full[:, 0] = 1.0
+        full[s:e] = p
+        return full
+    if isinstance(probs, dict):
+        final = _embed(probs['final'])
+        for w in probs['windows']:
+            w['start'] += s
+            w['end'] += s
+        return {'final': final, 'windows': probs['windows']}, np.argmax(final, axis=1)
+    final = _embed(probs)
+    return final, np.argmax(final, axis=1)
+
+
+def _infer_features(features, model, device, use_sliding_window=True, window_size=2000, step_size=500, return_all_windows=False, use_max_prob=False, show_progress=True):
+    """Sliding-window model inference over a (N, 22) feature matrix."""
     num_frames = len(features)
     
     # 2. Inference
@@ -563,7 +629,7 @@ def run_inference_on_video(dlc_path, model, device, use_sliding_window=True, win
         all_window_probs = [] if return_all_windows else None
         
         with torch.no_grad():
-            for start in starts:
+            for start in tqdm(starts, desc="  Inference windows", unit="win", leave=False, disable=not show_progress):
                 end = min(start + window_size, num_frames)
                 
                 if (end - start) < 10:
@@ -1935,7 +2001,53 @@ def batch_process_and_evaluate(
     }
 
 
-if __name__ == "__main__":
+def _run_cli():
+    """Command-line entry: run inference on one video (--video), one DLC file (--dlc), or a whole folder (--folder)."""
+    import argparse
+    parser = argparse.ArgumentParser(description="Rat hunt LSTM inference -> probs/, excel_files/, plots/ for review_gui.")
+    src = parser.add_mutually_exclusive_group(required=True)
+    src.add_argument("--video", help="Video to analyze; its DLC CSV is found next to it.")
+    src.add_argument("--dlc", help="DLC tracking CSV to analyze.")
+    src.add_argument("--folder", help="Analyze every DLC CSV in this folder.")
+    parser.add_argument("--model", required=True, help="Path to the trained rat .pth model.")
+    parser.add_argument("--label-folder", default=None, help="Optional manual labels, only used for the diagnostic plot.")
+    parser.add_argument("--window-size", type=int, default=6000)
+    parser.add_argument("--step-size", type=int, default=1000)
+    parser.add_argument("--cpu", action="store_true", help="Force CPU even if CUDA is available.")
+    parser.add_argument("--start-min", type=float, default=None, help="Only run the model from this time (minutes).")
+    parser.add_argument("--end-min", type=float, default=None, help="Only run the model up to this time (minutes).")
+    args = parser.parse_args()
+
+    dlc_files = None
+    if args.video:
+        dlc = find_dlc_for_video(args.video)
+        if dlc is None:
+            raise FileNotFoundError(f"No DLC CSV found next to {args.video}")
+        dlc_files = [dlc]
+    elif args.dlc:
+        dlc_files = [args.dlc]
+
+    device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
+    batch_process_dlc_folder(
+        folder_path=args.folder,
+        model_path=args.model,
+        device=device,
+        label_folder=args.label_folder,
+        window_size=args.window_size,
+        step_size=args.step_size,
+        output_subdir="excel_files",
+        plot_subdir="plots",
+        prob_subdir="probs",
+        dlc_files=dlc_files,
+        start_min=args.start_min,
+        end_min=args.end_min,
+    )
+
+
+if __name__ == "__main__" and len(sys.argv) > 1:
+    _run_cli()
+
+elif __name__ == "__main__":
 
     # Usage Example:
     # dlc_file = "path/to/video_dlc.csv"

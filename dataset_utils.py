@@ -121,8 +121,21 @@ MOUSE_DATASETS: Dict[str, Dict[str, Any]] = {
     #     'format': 'diane',
     #     'strategy': 'engagement',
     #     'file_filter': None,
+    #     'crop_offset': (x1, x2, y1, y2),  # Optional: DLC analysis crop (or just (x1, y1)), only used when DLC's _meta.pickle is missing
     # },
 }
+
+def get_dataset_crop_offset(dlc_path: str) -> Optional[Tuple[float, ...]]:
+    """Returns the 'crop_offset' ((x1, y1) or (x1, x2, y1, y2)) of the dataset whose dlc_dir contains dlc_path, if configured."""
+    target = os.path.normcase(os.path.abspath(dlc_path))
+    for cfg in list(DATASETS.values()) + list(MOUSE_DATASETS.values()):
+        offset, dlc_dir = cfg.get('crop_offset'), cfg.get('dlc_dir')
+        if offset is None or not dlc_dir:
+            continue
+        root = os.path.normcase(os.path.abspath(dlc_dir)).rstrip('\\/')
+        if target.startswith(root + os.sep):
+            return tuple(float(v) for v in offset)
+    return None
 
 VERBOSE = True
 DEFAULT_WIDTH = 514

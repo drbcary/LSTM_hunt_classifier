@@ -14,6 +14,7 @@ from PySide6.QtGui import QImage, QPixmap, QPainter, QColor, QPen, QShortcut, QK
 from typing import Any
 
 from dataset.matcher import DatasetMatcher
+from pose.crop import read_dlc_table
 import dataset_utils
 import RatHunt_Inference
 import MouseHunt_Inference
@@ -556,12 +557,17 @@ class ReviewGUI(QMainWindow):
         self.btn_paradigm.setMinimumWidth(0)
         
         self.lbl_info = ElidedLabel("No video loaded.")
-        
+
+        self.lbl_crop = QLabel()
+        self.lbl_crop.setStyleSheet("color: #FFB300; font-size: 11px; padding: 0 6px;")
+        self.lbl_crop.hide()
+
         top_layout.addWidget(self.btn_load_vid)
         top_layout.addWidget(self.btn_compare_mode)
         top_layout.addWidget(self.btn_load_label)
         top_layout.addWidget(self.btn_paradigm)
         top_layout.addWidget(self.lbl_info, stretch=1)
+        top_layout.addWidget(self.lbl_crop)
         layout.addLayout(top_layout)
         
         # Video Display
@@ -988,10 +994,8 @@ class ReviewGUI(QMainWindow):
     def load_dlc_tracking(self, dlc_path):
         """Loads all bodyparts and likelihoods from DLC CSV or H5."""
         try:
-            if dlc_path.endswith('.h5'):
-                df = pd.read_hdf(dlc_path)
-            else:
-                df = pd.read_csv(dlc_path, header=[0, 1, 2], index_col=0)
+            df, offset = read_dlc_table(dlc_path)
+            self._set_crop_indicator(offset)
             scorer = df.columns.get_level_values(0)[0]
             bparts = list(dict.fromkeys(df.columns.get_level_values(1)))
             
@@ -1013,6 +1017,17 @@ class ReviewGUI(QMainWindow):
             print(f"Failed to load DLC tracking from {dlc_path}: {e}")
             self.dlc_data = None
             self.dlc_confs = None
+            self._set_crop_indicator(None)
+
+    def _set_crop_indicator(self, offset):
+        """Shows which DLC crop offset (if any) was added to the displayed pose markers."""
+        if offset is None or not offset.is_applied:
+            self.lbl_crop.hide()
+            return
+        source = "DLC meta.pickle" if offset.source == 'meta' else "dataset config"
+        self.lbl_crop.setText(f"Crop offset +{offset.dx:g}, +{offset.dy:g} ({source})")
+        self.lbl_crop.setToolTip("DLC analysis was cropped; this offset was added to all pose coordinates to match the full video frame.")
+        self.lbl_crop.show()
 
     def _select_display_keypoints(self):
         """
@@ -1152,6 +1167,7 @@ class ReviewGUI(QMainWindow):
             self.dlc_path = None
             self.dlc_data = None
             self.dlc_confs = None
+            self._set_crop_indicator(None)
             print("No DLC found.")
             
         # 2. Find Probabilities (_probs.csv)

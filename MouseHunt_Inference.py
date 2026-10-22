@@ -235,6 +235,11 @@ class MouseInferencePipeline:
         if pose_data is None:
             raise ValueError(f"Could not load tracking data from {dlc_path}")
 
+        # Normalize by the DLC crop box (approximately the arena) rather than the full camera frame
+        if pose_data.crop_offset.width:
+            print(f"Using DLC crop width {pose_data.crop_offset.width:g}px (from {pose_data.crop_offset.source}) instead of video width {width}px for feature scaling")
+            width = pose_data.crop_offset.width
+
         # 2. Extract Features
         features, manifest = generate_features(
             pose_data=pose_data,
@@ -1953,8 +1958,9 @@ def export_evaluation_metrics(excel_path, frame_metrics_df, event_summary, timin
         print(f"Error exporting metrics Excel: {e}")
 
 def batch_process_dlc_folder(
-    folder_path: str,
+    folder_path: Optional[str],
     model_path: str,
+    dlc_files: Optional[Union[str, List[str]]] = None,
     device: Optional[torch.device] = None,
     label_folder: Optional[str] = None,
     label_format: Optional[str] = None,
@@ -1971,18 +1977,26 @@ def batch_process_dlc_folder(
     continuous_cricket_confidence: Optional[bool] = None
 ):
     """
-    Executes model batch inference across all DLC tracking files in folder_path.
+    Executes model batch inference across all DLC tracking files in folder_path,
+    or only the given dlc_files (folder_path then defaults to the first file's folder).
     Saves:
         - Class probabilities CSVs into prob_subdir
         - Structured analyzed event Excel sheets into output_subdir
         - Diagnostic prediction timeline plots into plot_subdir
     """
+    if isinstance(dlc_files, str):
+        dlc_files = [dlc_files]
+    if not folder_path:
+        if not dlc_files:
+            raise ValueError("Provide folder_path and/or dlc_files.")
+        folder_path = os.path.dirname(os.path.abspath(dlc_files[0]))
+
     pipeline = MouseInferencePipeline(
         model_weights_path=model_path,
         device=device,
         continuous_cricket_confidence=continuous_cricket_confidence
     )
-    
+
     output_dir = os.path.join(folder_path, output_subdir) if output_subdir else folder_path
     plot_dir = os.path.join(folder_path, plot_subdir) if plot_subdir else folder_path
     prob_dir = os.path.join(folder_path, prob_subdir) if prob_subdir else folder_path
@@ -2002,6 +2016,11 @@ def batch_process_dlc_folder(
             return False
         return True
 
+    if dlc_files:
+        missing = [f for f in dlc_files if not os.path.exists(f)]
+        if missing:
+            raise FileNotFoundError(f"DLC file(s) not found: {missing}")
+        all_candidates = list(dlc_files)
     valid_candidates = [f for f in all_candidates if _is_valid_dlc(f)]
     # Group by base stem so .csv is preferred over .h5
     seen_stems = {}
@@ -2043,14 +2062,17 @@ def batch_process_dlc_folder(
                                 label_path = cand
                                 break
                                 
-        # Check for matching video file
+        # Check for matching video file next to the DLC file
+        dlc_dir = os.path.dirname(os.path.abspath(dlc_file))
         video_candidates = [
-            os.path.join(folder_path, f"{clean_base}.avi"),
-            os.path.join(folder_path, f"{clean_base}.mp4"),
-            os.path.join(folder_path, f"{clean_base}_VIDEO.avi"),
-            os.path.join(folder_path, f"{clean_base}_VIDEO.mp4"),
+            os.path.join(dlc_dir, f"{clean_base}.avi"),
+            os.path.join(dlc_dir, f"{clean_base}.mp4"),
+            os.path.join(dlc_dir, f"{clean_base}_VIDEO.avi"),
+            os.path.join(dlc_dir, f"{clean_base}_VIDEO.mp4"),
         ]
         video_file = next((v for v in video_candidates if os.path.exists(v)), None)
+        if video_file is None:
+            print(f"Warning: no video found for {clean_base}; FPS/width fall back to config defaults.")
         
         try:
             res = pipeline.run_on_session(
